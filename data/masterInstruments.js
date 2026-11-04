@@ -1,0 +1,127 @@
+const masterInstruments = [
+  // --- INDICES & ETFS ---
+  { symbol: "NIFTY 50", name: "Nifty 50 Index", exchange: "NSE", sector: "Indices", price: 24340.60, change: -125.40, percent: "-0.51%", isDown: true },
+  { symbol: "BANKNIFTY", name: "Nifty Bank Index", exchange: "NSE", sector: "Indices", price: 51280.40, change: 180.20, percent: "+0.35%", isDown: false },
+  { symbol: "NIFTYIT", name: "Nifty IT Index", exchange: "NSE", sector: "Indices", price: 42150.80, change: 210.50, percent: "+0.50%", isDown: false },
+  { symbol: "GOLDBEES", name: "Nippon India ETF Gold BeES", exchange: "NSE", sector: "ETFs", price: 68.45, change: 0.35, percent: "+0.51%", isDown: false },
+  { symbol: "SILVERBEES", name: "Nippon India ETF Silver BeES", exchange: "NSE", sector: "ETFs", price: 89.20, change: -0.40, percent: "-0.45%", isDown: true },
+  { symbol: "NIFTYBEES", name: "Nippon India ETF Nifty BeES", exchange: "NSE", sector: "ETFs", price: 265.10, change: -1.20, percent: "-0.45%", isDown: true },
+  { symbol: "BANKBEES", name: "Nippon India ETF Bank BeES", exchange: "NSE", sector: "ETFs", price: 532.40, change: 2.10, percent: "+0.40%", isDown: false },
+
+  // --- BANKING & FINANCIAL SERVICES ---
+  { symbol: "HDFCBANK", name: "HDFC Bank Ltd.", exchange: "NSE", sector: "Banking", price: 1728.15, change: -6.40, percent: "-0.37%", isDown: true },
+  { symbol: "ICICIBANK", name: "ICICI Bank Ltd.", exchange: "NSE", sector: "Banking", price: 1242.00, change: 11.80, percent: "+0.96%", isDown: false },
+  { symbol: "SBIN", name: "State Bank of India", exchange: "NSE", sector: "Banking", price: 814.65, change: -4.50, percent: "-0.55%", isDown: true },
+  { symbol: "KOTAKBANK", name: "Kotak Mahindra Bank Ltd.", exchange: "NSE", sector: "Banking", price: 1785.40, change: 8.20, percent: "+0.46%", isDown: false },
+  { symbol: "AXISBANK", name: "Axis Bank Ltd.", exchange: "NSE", sector: "Banking", price: 1165.80, change: -9.50, percent: "-0.81%", isDown: true },
+  { symbol: "INDUSINDBK", name: "IndusInd Bank Ltd.", exchange: "NSE", sector: "Banking", price: 1042.30, change: -14.60, percent: "-1.38%", isDown: true },
+  { symbol: "BAJFINANCE", name: "Bajaj Finance Ltd.", exchange: "NSE", sector: "Financial Services", price: 6890.00, change: -45.50, percent: "-0.66%", isDown: true },
+  { symbol: "BAJAJFINSV", name: "Bajaj Finserv Ltd.", exchange: "NSE", sector: "Financial Services", price: 1740.25, change: 12.10, percent: "+0.70%", isDown: false },
+  { symbol: "CHOLAFIN", name: "Cholamandalam Investment", exchange: "NSE", sector: "Financial Services", price: 1395.00, change: 18.50, percent: "+1.34%", isDown: false },
+  { symbol: "MUTHOOTFIN", name: "Muthoot Finance Ltd.", exchange: "NSE", sector: "Financial Services", price: 1980.50, change: 25.00, percent: "+1.28%", isDown: false },
+  { symbol: "SHRIRAMFIN", name: "Shriram Finance Ltd.", exchange: "NSE", sector: "Financial Services", price: 3240.00, change: 34.00, percent: "+1.06%", isDown: false },
+  { symbol: "FEDERALBNK", name: "Federal Bank Ltd.", exchange: "NSE", sector: "Banking", price: 196.40, change: 1.80, percent: "+0.92%", isDown: false },
+  { symbol: "IDFCFIRSTB", name: "IDFC First Bank Ltd.", exchange: "NSE", sector: "Banking", price: 68.20, change: -0.45, percent: "-0.66%", isDown: true },
+  { symbol: "PNB", name: "Punjab National Bank", exchange: "NSE", sector: "Banking", price: 104.50, change: -0.80, percent: "-0.76%", isDown: true },
+  { symbol: "BANKBARODA", name: "Bank of Baroda", exchange: "NSE", sector: "Banking", price: 248.60, change: 2.30, percent: "+0.93%", isDown: false },
+
+  // --- INFORMATION TECHNOLOGY ---
+  { symbol: "TCS", name: "Tata Consultancy Services Ltd.", exchange: "NSE", sector: "Technology", price: 3982.75, change: 15.60, percent: "+0.39%", isDown: false },
+  { symbol: "INFY", name: "Infosys Ltd.", exchange: "NSE", sector: "Technology", price: 1845.50, change: -18.25, percent: "-0.98%", isDown: true },
+  { symbol: "WIPRO", name: "Wipro Ltd.", exchange: "NSE", sector: "Technology", price: 546.80, change: -5.20, percent: "-0.94%", isDown: true },
+  { symbol: "HCLTECH", name: "HCL Technologies Ltd.", exchange: "NSE", sector: "Technology", price: 1820.00, change: 14.50, percent: "+0.80%", isDown: false },
+  { symbol: "TECHM", name: "Tech Mahindra Ltd.", exchange: "NSE", sector: "Technology", price: 1680.40, change: 22.00, percent: "+1.33%", isDown: false },
+  { symbol: "LTIM", name: "LTIMindtree Ltd.", exchange: "NSE", sector: "Technology", price: 5920.00, change: -35.00, percent: "-0.59%", isDown: true },
+  { symbol: "PERSISTENT", name: "Persistent Systems Ltd.", exchange: "NSE", sector: "Technology", price: 5450.00, change: 75.00, percent: "+1.40%", isDown: false },
+  { symbol: "COFORGE", name: "Coforge Ltd.", exchange: "NSE", sector: "Technology", price: 7680.00, change: 110.00, percent: "+1.45%", isDown: false },
+  { symbol: "TATAELXSI", name: "Tata Elxsi Ltd.", exchange: "NSE", sector: "Technology", price: 6850.00, change: -40.00, percent: "-0.58%", isDown: true },
+  { symbol: "KPITTECH", name: "KPIT Technologies Ltd.", exchange: "NSE", sector: "Technology", price: 1480.00, change: 12.00, percent: "+0.82%", isDown: false },
+  { symbol: "ZOMATO", name: "Zomato Ltd.", exchange: "NSE", sector: "Technology", price: 262.40, change: 5.60, percent: "+2.18%", isDown: false },
+  { symbol: "NAUKRI", name: "Info Edge (India) Ltd.", exchange: "NSE", sector: "Technology", price: 7890.00, change: 80.00, percent: "+1.02%", isDown: false },
+  { symbol: "PAYTM", name: "One 97 Communications (Paytm)", exchange: "NSE", sector: "Technology", price: 820.50, change: 15.20, percent: "+1.89%", isDown: false },
+
+  // --- ENERGY, OIL, GAS & POWER ---
+  { symbol: "RELIANCE", name: "Reliance Industries Ltd.", exchange: "NSE", sector: "Energy", price: 2712.40, change: 24.30, percent: "+0.90%", isDown: false },
+  { symbol: "ONGC", name: "Oil & Natural Gas Corp.", exchange: "NSE", sector: "Energy", price: 264.30, change: -2.10, percent: "-0.79%", isDown: true },
+  { symbol: "NTPC", name: "NTPC Ltd.", exchange: "NSE", sector: "Power", price: 388.50, change: 3.40, percent: "+0.88%", isDown: false },
+  { symbol: "POWERGRID", name: "Power Grid Corp of India", exchange: "NSE", sector: "Power", price: 318.20, change: -1.50, percent: "-0.47%", isDown: true },
+  { symbol: "COALINDIA", name: "Coal India Ltd.", exchange: "NSE", sector: "Energy", price: 442.80, change: 4.20, percent: "+0.96%", isDown: false },
+  { symbol: "BPCL", name: "Bharat Petroleum Corp.", exchange: "NSE", sector: "Energy", price: 308.50, change: -3.20, percent: "-1.03%", isDown: true },
+  { symbol: "IOC", name: "Indian Oil Corp. Ltd.", exchange: "NSE", sector: "Energy", price: 142.10, change: 0.85, percent: "+0.60%", isDown: false },
+  { symbol: "ADANIENT", name: "Adani Enterprises Ltd.", exchange: "NSE", sector: "Energy & Infra", price: 2840.00, change: 35.00, percent: "+1.25%", isDown: false },
+  { symbol: "ADANIPORTS", name: "Adani Ports and SEZ Ltd.", exchange: "NSE", sector: "Infrastructure", price: 1360.00, change: 14.50, percent: "+1.08%", isDown: false },
+  { symbol: "ADANIGREEN", name: "Adani Green Energy Ltd.", exchange: "NSE", sector: "Power", price: 1540.00, change: -18.00, percent: "-1.16%", isDown: true },
+  { symbol: "TATAPOWER", name: "Tata Power Co. Ltd.", exchange: "NSE", sector: "Power", price: 428.60, change: 6.20, percent: "+1.47%", isDown: false },
+  { symbol: "GAIL", name: "GAIL (India) Ltd.", exchange: "NSE", sector: "Energy", price: 198.50, change: 1.10, percent: "+0.56%", isDown: false },
+
+  // --- AUTOMOBILE & AUTO ANCILLARY ---
+  { symbol: "TATAMOTORS", name: "Tata Motors Ltd.", exchange: "NSE", sector: "Automobile", price: 884.20, change: -12.10, percent: "-1.35%", isDown: true },
+  { symbol: "MARUTI", name: "Maruti Suzuki India Ltd.", exchange: "NSE", sector: "Automobile", price: 11240.50, change: 85.00, percent: "+0.76%", isDown: false },
+  { symbol: "M&M", name: "Mahindra & Mahindra Ltd.", exchange: "NSE", sector: "Automobile", price: 2940.00, change: 38.00, percent: "+1.31%", isDown: false },
+  { symbol: "BAJAJ-AUTO", name: "Bajaj Auto Ltd.", exchange: "NSE", sector: "Automobile", price: 9850.00, change: -65.00, percent: "-0.66%", isDown: true },
+  { symbol: "HEROMOTOCO", name: "Hero MotoCorp Ltd.", exchange: "NSE", sector: "Automobile", price: 4720.00, change: 25.00, percent: "+0.53%", isDown: false },
+  { symbol: "EICHERMOT", name: "Eicher Motors Ltd.", exchange: "NSE", sector: "Automobile", price: 4890.00, change: 52.00, percent: "+1.07%", isDown: false },
+  { symbol: "TVSMOTOR", name: "TVS Motor Co. Ltd.", exchange: "NSE", sector: "Automobile", price: 2420.00, change: 30.00, percent: "+1.26%", isDown: false },
+  { symbol: "BHARATFORG", name: "Bharat Forge Ltd.", exchange: "NSE", sector: "Auto Ancillary", price: 1380.00, change: -11.00, percent: "-0.79%", isDown: true },
+  { symbol: "ASHOKLEY", name: "Ashok Leyland Ltd.", exchange: "NSE", sector: "Automobile", price: 218.40, change: 2.10, percent: "+0.97%", isDown: false },
+  { symbol: "BOSCHLTD", name: "Bosch Ltd.", exchange: "NSE", sector: "Auto Ancillary", price: 33200.00, change: 180.00, percent: "+0.55%", isDown: false },
+  { symbol: "MRF", name: "MRF Ltd.", exchange: "NSE", sector: "Auto Ancillary", price: 128450.00, change: -450.00, percent: "-0.35%", isDown: true },
+
+  // --- FMCG & CONSUMER RETAIL ---
+  { symbol: "ITC", name: "ITC Ltd.", exchange: "NSE", sector: "FMCG", price: 478.30, change: 1.15, percent: "+0.24%", isDown: false },
+  { symbol: "HINDUNILVR", name: "Hindustan Unilever Ltd.", exchange: "NSE", sector: "FMCG", price: 2382.40, change: 8.90, percent: "+0.38%", isDown: false },
+  { symbol: "NESTLEIND", name: "Nestle India Ltd.", exchange: "NSE", sector: "FMCG", price: 2280.00, change: -14.00, percent: "-0.61%", isDown: true },
+  { symbol: "BRITANNIA", name: "Britannia Industries Ltd.", exchange: "NSE", sector: "FMCG", price: 5040.00, change: 28.00, percent: "+0.56%", isDown: false },
+  { symbol: "TATACONSUM", name: "Tata Consumer Products", exchange: "NSE", sector: "FMCG", price: 1015.00, change: 6.50, percent: "+0.64%", isDown: false },
+  { symbol: "DABUR", name: "Dabur India Ltd.", exchange: "NSE", sector: "FMCG", price: 524.00, change: -2.80, percent: "-0.53%", isDown: true },
+  { symbol: "MARICO", name: "Marico Ltd.", exchange: "NSE", sector: "FMCG", price: 632.50, change: 5.20, percent: "+0.83%", isDown: false },
+  { symbol: "GODREJCP", name: "Godrej Consumer Products", exchange: "NSE", sector: "FMCG", price: 1180.00, change: 10.00, percent: "+0.85%", isDown: false },
+  { symbol: "VBL", name: "Varun Beverages Ltd.", exchange: "NSE", sector: "FMCG", price: 585.00, change: 9.20, percent: "+1.60%", isDown: false },
+  { symbol: "DMART", name: "Avenue Supermarts (DMart)", exchange: "NSE", sector: "Retail", price: 3840.00, change: -45.00, percent: "-1.16%", isDown: true },
+  { symbol: "TITAN", name: "Titan Company Ltd.", exchange: "NSE", sector: "Consumer Durables", price: 3260.00, change: 22.00, percent: "+0.68%", isDown: false },
+  { symbol: "TRENT", name: "Trent Ltd.", exchange: "NSE", sector: "Retail", price: 6720.00, change: 140.00, percent: "+2.13%", isDown: false },
+
+  // --- PHARMA & HEALTHCARE ---
+  { symbol: "SUNPHARMA", name: "Sun Pharmaceutical Industries", exchange: "NSE", sector: "Healthcare", price: 1782.30, change: 14.20, percent: "+0.80%", isDown: false },
+  { symbol: "CIPLA", name: "Cipla Ltd.", exchange: "NSE", sector: "Healthcare", price: 1540.00, change: -8.50, percent: "-0.55%", isDown: true },
+  { symbol: "DRREDDY", name: "Dr. Reddy's Laboratories", exchange: "NSE", sector: "Healthcare", price: 1260.00, change: 11.00, percent: "+0.88%", isDown: false },
+  { symbol: "DIVISLAB", name: "Divi's Laboratories Ltd.", exchange: "NSE", sector: "Healthcare", price: 5740.00, change: 45.00, percent: "+0.79%", isDown: false },
+  { symbol: "APOLLOHOSP", name: "Apollo Hospitals Enterprise", exchange: "NSE", sector: "Healthcare", price: 7120.00, change: 85.00, percent: "+1.21%", isDown: false },
+  { symbol: "LUPIN", name: "Lupin Ltd.", exchange: "NSE", sector: "Healthcare", price: 2150.00, change: 24.00, percent: "+1.13%", isDown: false },
+  { symbol: "AUROPHARMA", name: "Aurobindo Pharma Ltd.", exchange: "NSE", sector: "Healthcare", price: 1290.00, change: -12.00, percent: "-0.92%", isDown: true },
+  { symbol: "MANKIND", name: "Mankind Pharma Ltd.", exchange: "NSE", sector: "Healthcare", price: 2540.00, change: 30.00, percent: "+1.20%", isDown: false },
+  { symbol: "TORNTPHARM", name: "Torrent Pharmaceuticals", exchange: "NSE", sector: "Healthcare", price: 3180.00, change: 18.00, percent: "+0.57%", isDown: false },
+
+  // --- INFRASTRUCTURE, METALS & MINING ---
+  { symbol: "LT", name: "Larsen & Toubro Ltd.", exchange: "NSE", sector: "Infrastructure", price: 3560.10, change: -28.75, percent: "-0.80%", isDown: true },
+  { symbol: "TATASTEEL", name: "Tata Steel Ltd.", exchange: "NSE", sector: "Metals", price: 152.40, change: 1.60, percent: "+1.06%", isDown: false },
+  { symbol: "JSWSTEEL", name: "JSW Steel Ltd.", exchange: "NSE", sector: "Metals", price: 975.00, change: -6.50, percent: "-0.66%", isDown: true },
+  { symbol: "HINDALCO", name: "Hindalco Industries Ltd.", exchange: "NSE", sector: "Metals", price: 685.00, change: 8.50, percent: "+1.26%", isDown: false },
+  { symbol: "VEDL", name: "Vedanta Ltd.", exchange: "NSE", sector: "Metals", price: 462.00, change: 5.40, percent: "+1.18%", isDown: false },
+  { symbol: "JINDALSTEL", name: "Jindal Steel & Power Ltd.", exchange: "NSE", sector: "Metals", price: 924.00, change: 11.00, percent: "+1.20%", isDown: false },
+  { symbol: "ULTRACEMCO", name: "UltraTech Cement Ltd.", exchange: "NSE", sector: "Cement", price: 11150.00, change: -60.00, percent: "-0.54%", isDown: true },
+  { symbol: "AMBUJACEM", name: "Ambuja Cements Ltd.", exchange: "NSE", sector: "Cement", price: 565.00, change: 4.20, percent: "+0.75%", isDown: false },
+  { symbol: "GRASIM", name: "Grasim Industries Ltd.", exchange: "NSE", sector: "Conglomerate", price: 2610.00, change: 18.00, percent: "+0.69%", isDown: false },
+
+  // --- DEFENSE, AEROSPACE & PSUS ---
+  { symbol: "HAL", name: "Hindustan Aeronautics Ltd.", exchange: "NSE", sector: "Defense", price: 4420.00, change: 85.00, percent: "+1.96%", isDown: false },
+  { symbol: "BEL", name: "Bharat Electronics Ltd.", exchange: "NSE", sector: "Defense", price: 294.00, change: 4.50, percent: "+1.55%", isDown: false },
+  { symbol: "BHEL", name: "Bharat Heavy Electricals", exchange: "NSE", sector: "Capital Goods", price: 242.00, change: 3.20, percent: "+1.34%", isDown: false },
+  { symbol: "MAZDOCK", name: "Mazagon Dock Shipbuilders", exchange: "NSE", sector: "Defense", price: 4180.00, change: 120.00, percent: "+2.96%", isDown: false },
+  { symbol: "COCHINSHIP", name: "Cochin Shipyard Ltd.", exchange: "NSE", sector: "Defense", price: 1520.00, change: 42.00, percent: "+2.84%", isDown: false },
+  { symbol: "RVNL", name: "Rail Vikas Nigam Ltd.", exchange: "NSE", sector: "Railways", price: 450.00, change: 12.00, percent: "+2.74%", isDown: false },
+  { symbol: "IRCTC", name: "Indian Railway Catering & Tourism", exchange: "NSE", sector: "Railways", price: 835.00, change: -5.00, percent: "-0.60%", isDown: true },
+  { symbol: "PFC", name: "Power Finance Corporation", exchange: "NSE", sector: "Financial Services", price: 468.00, change: 6.20, percent: "+1.34%", isDown: false },
+  { symbol: "RECLTD", name: "REC Ltd.", exchange: "NSE", sector: "Financial Services", price: 512.00, change: 7.50, percent: "+1.49%", isDown: false },
+
+  // --- TELECOM, MEDIA & REAL ESTATE ---
+  { symbol: "BHARTIARTL", name: "Bharti Airtel Ltd.", exchange: "NSE", sector: "Telecom", price: 1684.90, change: 22.40, percent: "+1.35%", isDown: false },
+  { symbol: "IDEA", name: "Vodafone Idea Ltd.", exchange: "NSE", sector: "Telecom", price: 7.85, change: -0.15, percent: "-1.88%", isDown: true },
+  { symbol: "DLF", name: "DLF Ltd.", exchange: "NSE", sector: "Realty", price: 815.00, change: 12.00, percent: "+1.49%", isDown: false },
+  { symbol: "GODREJPROP", name: "Godrej Properties Ltd.", exchange: "NSE", sector: "Realty", price: 2820.00, change: 40.00, percent: "+1.44%", isDown: false },
+  { symbol: "OBEROIRLTY", name: "Oberoi Realty Ltd.", exchange: "NSE", sector: "Realty", price: 1980.00, change: 25.00, percent: "+1.28%", isDown: false },
+  { symbol: "PVRINOX", name: "PVR INOX Ltd.", exchange: "NSE", sector: "Media", price: 1480.00, change: -12.00, percent: "-0.80%", isDown: true },
+  { symbol: "SUNTV", name: "Sun TV Network Ltd.", exchange: "NSE", sector: "Media", price: 760.00, change: 4.50, percent: "+0.60%", isDown: false }
+];
+
+module.exports = { masterInstruments };

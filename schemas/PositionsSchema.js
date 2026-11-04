@@ -1,6 +1,10 @@
 const { Schema } = require("mongoose");
 
 const PositionsSchema = new Schema({
+    userId: {
+        type: String,
+        default: "ZU9344",
+    },
     product: String,
     name: String,
     instrument: String,

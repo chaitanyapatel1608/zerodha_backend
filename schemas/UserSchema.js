@@ -1,5 +1,34 @@
 const { Schema } = require("mongoose");
 
+const NomineeSubSchema = new Schema(
+  {
+    fullName: { type: String, default: "" },
+    relationship: { type: String, default: "Spouse" },
+    dob: { type: String, default: "" },
+    isMinor: { type: Boolean, default: false },
+    guardian: {
+      fullName: { type: String, default: "" },
+      relationship: { type: String, default: "Father" },
+      idType: { type: String, default: "PAN" },
+      idNumber: { type: String, default: "" },
+      phone: { type: String, default: "" },
+      address: { type: String, default: "" },
+    },
+    idType: {
+      type: String,
+      default: "PAN",
+    },
+    idNumber: { type: String, default: "" },
+    pan: { type: String, default: "" },
+    email: { type: String, default: "" },
+    phone: { type: String, default: "" },
+    address: { type: String, default: "" },
+    allocation: { type: Number, default: 100 },
+    submittedAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
 const UserSchema = new Schema({
   userId: { 
     type: String, 
@@ -45,8 +74,25 @@ const UserSchema = new Schema({
     type: String,
     default: "Zerodha Broking Ltd.",
   },
+  address: {
+    type: String,
+    default: "",
+  },
   password: {
     type: String,
+  },
+  nomineeStatus: {
+    type: String,
+    enum: ['PENDING', 'VERIFIED', 'OPTED_OUT'],
+    default: 'PENDING',
+  },
+  nominees: {
+    type: [NomineeSubSchema],
+    default: [],
+  },
+  nominee: {
+    type: NomineeSubSchema,
+    default: null,
   },
   role: { 
     type: String, 
