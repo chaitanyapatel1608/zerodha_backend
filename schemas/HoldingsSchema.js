@@ -3,7 +3,8 @@ const { Schema } = require("mongoose");
 const HoldingsSchema = new Schema({
     userId: {
         type: String,
-        default: "ZU9344",
+        required: true,
+        index: true,
     },
     name: String,
     instrument: String,

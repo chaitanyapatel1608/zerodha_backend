@@ -7,7 +7,6 @@ const NotificationSchema = new Schema(
       type: String,
       required: true,
       index: true,
-      default: "ZU9344",
     },
     type: {
       type: String,

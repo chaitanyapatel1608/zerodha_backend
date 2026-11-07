@@ -12,7 +12,8 @@ const BasketItemSchema = new Schema({
 const BasketSchema = new Schema({
   userId: {
     type: String,
-    default: "ZU9344",
+    required: true,
+    index: true,
   },
   name: {
     type: String,

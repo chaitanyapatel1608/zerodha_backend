@@ -3,7 +3,8 @@ const { Schema } = require("mongoose");
 const GttSchema = new Schema({
   userId: {
     type: String,
-    default: "ZU9344",
+    required: true,
+    index: true,
   },
   gttId: {
     type: String,
