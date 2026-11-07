@@ -15,15 +15,35 @@ const { WatchlistModel } = require("./model/WatchlistModel");
 const { FundsModel } = require("./model/FundsModel");
 const { IpoModel } = require("./model/IpoModel");
 const { IpoApplicationModel } = require("./model/IpoApplicationModel");
+const { GsecBidModel } = require("./model/GsecBidModel");
+const { CorporateActionModel } = require("./model/CorporateActionModel");
+const { AuctionModel } = require("./model/AuctionModel");
+const { AuctionOfferModel } = require("./model/AuctionOfferModel");
+const { SseIpoModel } = require("./model/SseIpoModel");
+const { SseApplicationModel } = require("./model/SseApplicationModel");
 const { UserModel } = require("./model/UserModel");
 const { GttModel } = require("./model/GttModel");
 const { BasketModel } = require("./model/BasketModel");
+const { SipModel } = require("./model/SipModel");
 const { UserWatchlistModel } = require("./model/UserWatchlistModel");
 const { NotificationModel } = require("./model/NotificationModel");
 const { masterInstruments } = require("./data/masterInstruments");
 const { OtpModel } = require("./model/OtpModel");
-const { sendOtpEmail, sendIpoMandateEmail } = require("./utils/emailService");
+const {
+  sendOtpEmail,
+  sendIpoMandateEmail,
+  sendSipFailureEmail,
+  sendSipSuccessEmail,
+  sendAlertTriggeredEmail,
+  sendCdslTpinEmail,
+  sendCdslTransactionOtpEmail,
+} = require("./utils/emailService");
 const { ipoData50 } = require("./data/ipoData50");
+const { marketSips50 } = require("./data/marketSips50");
+const { InstrumentModel } = require("./model/InstrumentModel");
+const { MarketSipCatalogModel } = require("./model/MarketSipCatalogModel");
+const AlertModel = require("./model/AlertModel");
+const { seedCatalogsToDb } = require("./data/seedCatalogsToDb");
 
 const app = express();
 const PORT = process.env.PORT || 3002;
@@ -46,7 +66,10 @@ const otpLimiter = rateLimit({
 // MongoDB Connection
 mongoose
   .connect(uri)
-  .then(() => console.log("DB connected successfully!"))
+  .then(() => {
+    console.log("DB connected successfully!");
+    seedCatalogsToDb();
+  })
   .catch((err) => console.error("DB connection error:", err));
 
 // ==========================================
@@ -433,17 +456,45 @@ app.post("/kite-login", async (req, res) => {
 });
 
 // 3. Verify Active Session Token
+
+// Helper: Resolve dynamic userId from JWT token, query param, or request body (strictly multi-user)
+function getAuthenticatedUserId(req) {
+  const authHeader = req.headers?.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    try {
+      const token = authHeader.split(" ")[1];
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (decoded && decoded.userId) {
+        return decoded.userId;
+      }
+    } catch (e) {}
+  }
+  const explicitId = req.query?.userId || req.body?.userId;
+  if (explicitId && typeof explicitId === "string" && explicitId.trim() !== "") {
+    return explicitId.trim();
+  }
+  return null;
+}
+
 app.get("/verifyUser", async (req, res) => {
   try {
+    let resolvedUserId = null;
     const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({ success: false, message: "Access token missing or malformed" });
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        const token = authHeader.split(" ")[1];
+        const decoded = jwt.verify(token, JWT_SECRET);
+        resolvedUserId = decoded?.userId;
+      } catch (e) {}
+    }
+    if (!resolvedUserId && req.query?.userId) {
+      resolvedUserId = req.query.userId.trim();
+    }
+    if (!resolvedUserId) {
+      return res.status(401).json({ success: false, message: "User identity or token required" });
     }
 
-    const token = authHeader.split(" ")[1];
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    const user = await UserModel.findOne({ userId: decoded.userId }).select("-__v");
+    const user = await UserModel.findOne({ userId: resolvedUserId }).select("-__v");
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
@@ -457,16 +508,18 @@ app.get("/verifyUser", async (req, res) => {
         phone: user.phone || "",
         pan: user.pan || "",
         dob: user.dob || "",
-        demat: user.demat || "1208160012345678",
+        demat: user.demat || ("12081600" + Math.floor(10000000 + Math.random() * 90000000)),
         annualIncome: user.annualIncome || "₹1L - ₹5L",
         tradingExp: user.tradingExp || "1-3 Years",
         broker: user.broker || "Zerodha Broking Ltd.",
         avatarText: user.avatarText,
         role: user.role,
+        nomineeStatus: user.nomineeStatus || "PENDING",
+        nominees: user.nominees || [],
       },
     });
   } catch (error) {
-    return res.status(401).json({ success: false, message: "Invalid or expired token" });
+    return res.status(500).json({ success: false, message: "Error verifying user profile" });
   }
 });
 
@@ -476,7 +529,11 @@ app.get("/verifyUser", async (req, res) => {
 
 app.get("/allHoldings", async (req, res) => {
   try {
-    const allHoldings = await HoldingsModel.find({});
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(200).json([]);
+    }
+    const allHoldings = await HoldingsModel.find({ userId });
     res.status(200).json(allHoldings);
   } catch (error) {
     console.error("Error fetching holdings:", error);
@@ -486,7 +543,11 @@ app.get("/allHoldings", async (req, res) => {
 
 app.get("/allPositions", async (req, res) => {
   try {
-    const allPositions = await PositionsModel.find({});
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(200).json([]);
+    }
+    const allPositions = await PositionsModel.find({ userId });
     res.status(200).json(allPositions);
   } catch (error) {
     console.error("Error fetching positions:", error);
@@ -494,9 +555,328 @@ app.get("/allPositions", async (req, res) => {
   }
 });
 
+// ==========================================
+// POSITIONS ENGINE (SQUARE OFF & CONVERT)
+// ==========================================
+
+// 1. Square Off Single Position (MIS or Overnight)
+app.post("/squareOffPosition", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const { positionId, exitPrice } = req.body;
+    const position = await PositionsModel.findOne({ _id: positionId, userId });
+    if (!position || position.qty === 0) {
+      return res.status(400).json({ success: false, message: "Position not found or already squared off." });
+    }
+
+    const sym = position.instrument || position.name;
+    const ltp = Number(exitPrice) || position.ltp || position.price || position.avg;
+    const qty = position.qty;
+    const avg = position.avg || ltp;
+
+    // Realized P&L calculation:
+    // Long (qty > 0): (ltp - avg) * qty
+    // Short (qty < 0): (avg - ltp) * Math.abs(qty)
+    const realizedPnl = Number((qty > 0 ? (ltp - avg) * qty : (avg - ltp) * Math.abs(qty)).toFixed(2));
+
+    // Release margin and add/deduct P&L from funds
+    const funds = await getOrCreateUserFunds(userId);
+    if (funds) {
+      const orderCost = Math.abs(qty) * avg;
+      const marginBlocked = (position.product || "MIS") === "MIS" ? orderCost * 0.2 : orderCost;
+      let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
+      let currentUsed = parseFloat(funds.equity.usedMargin.replace(/,/g, "")) || 0;
+
+      currentAvailable += (marginBlocked + realizedPnl);
+      currentUsed = Math.max(0, currentUsed - marginBlocked);
+
+      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
+      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
+      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
+      await funds.save();
+    }
+
+    // Record square off order in OrdersModel
+    const exitMode = qty > 0 ? "SELL" : "BUY";
+    const exitOrder = new OrdersModel({
+      userId,
+      name: sym,
+      qty: Math.abs(qty),
+      price: ltp,
+      mode: exitMode,
+      product: position.product || "MIS",
+      status: "COMPLETE",
+      tag: "SQUARE_OFF",
+    });
+    await exitOrder.save();
+
+    // Mark position as closed with final realized P&L
+    position.realizedPnl = Number(((position.realizedPnl || 0) + realizedPnl).toFixed(2));
+    position.pnl = position.realizedPnl;
+    position.unrealizedPnl = 0;
+    position.qty = 0;
+    position.ltp = ltp;
+    position.status = "CLOSED";
+    position.closedAt = new Date();
+    position.isProfit = position.realizedPnl >= 0;
+    position.isLoss = position.realizedPnl < 0;
+    await position.save();
+
+    // Send in-app notification
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "TRADE",
+        title: `Position Squared Off: ${sym}`,
+        description: `Closed ${Math.abs(qty)} ${sym} (${position.product}) @ ₹${ltp.toFixed(2)}. Realized P&L: ${realizedPnl >= 0 ? "+" : ""}₹${realizedPnl.toFixed(2)}`,
+        status: "SUCCESS",
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: `Position in ${sym} squared off successfully! Realized P&L: ${realizedPnl >= 0 ? "+" : ""}₹${realizedPnl.toFixed(2)}`,
+      position,
+      realizedPnl,
+    });
+  } catch (error) {
+    console.error("Error squaring off position:", error);
+    res.status(500).json({ success: false, message: "Failed to square off position." });
+  }
+});
+
+// 2. Square Off All Open Positions (Emergency / 15:20 RMS Square Off)
+app.post("/squareOffAllPositions", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const openPositions = await PositionsModel.find({ userId, qty: { $ne: 0 } });
+    if (!openPositions || openPositions.length === 0) {
+      return res.status(400).json({ success: false, message: "No open positions to square off." });
+    }
+
+    const funds = await getOrCreateUserFunds(userId);
+    let totalRealized = 0;
+    const closedPositions = [];
+
+    for (const pos of openPositions) {
+      const sym = pos.instrument || pos.name;
+      const ltp = pos.ltp || pos.price || pos.avg;
+      const qty = pos.qty;
+      const avg = pos.avg || ltp;
+      const pnl = Number((qty > 0 ? (ltp - avg) * qty : (avg - ltp) * Math.abs(qty)).toFixed(2));
+      totalRealized += pnl;
+
+      if (funds) {
+        const orderCost = Math.abs(qty) * avg;
+        const marginBlocked = (pos.product || "MIS") === "MIS" ? orderCost * 0.2 : orderCost;
+        let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
+        let currentUsed = parseFloat(funds.equity.usedMargin.replace(/,/g, "")) || 0;
+
+        currentAvailable += (marginBlocked + pnl);
+        currentUsed = Math.max(0, currentUsed - marginBlocked);
+
+        funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
+        funds.equity.usedMargin = formatIndianCurrency(currentUsed);
+        funds.equity.availableCash = formatIndianCurrency(currentAvailable);
+      }
+
+      // Exit order log
+      const exitOrder = new OrdersModel({
+        userId,
+        name: sym,
+        qty: Math.abs(qty),
+        price: ltp,
+        mode: qty > 0 ? "SELL" : "BUY",
+        product: pos.product || "MIS",
+        status: "COMPLETE",
+        tag: "RMS_SQUARE_OFF_ALL",
+      });
+      await exitOrder.save();
+
+      pos.realizedPnl = Number(((pos.realizedPnl || 0) + pnl).toFixed(2));
+      pos.pnl = pos.realizedPnl;
+      pos.unrealizedPnl = 0;
+      pos.qty = 0;
+      pos.ltp = ltp;
+      pos.status = "CLOSED";
+      pos.closedAt = new Date();
+      pos.isProfit = pos.realizedPnl >= 0;
+      pos.isLoss = pos.realizedPnl < 0;
+      await pos.save();
+      closedPositions.push(pos);
+    }
+
+    if (funds) await funds.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "SYSTEM",
+        title: `All Positions Squared Off (${closedPositions.length})`,
+        description: `Emergency square-off executed for ${closedPositions.length} open position(s). Total Day Realized P&L: ${totalRealized >= 0 ? "+" : ""}₹${totalRealized.toFixed(2)}.`,
+        status: "SUCCESS",
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: `All ${closedPositions.length} open positions squared off at market price! Total Realized P&L: ${totalRealized >= 0 ? "+" : ""}₹${totalRealized.toFixed(2)}`,
+      count: closedPositions.length,
+      totalRealized,
+      positions: closedPositions,
+    });
+  } catch (error) {
+    console.error("Error squaring off all positions:", error);
+    res.status(500).json({ success: false, message: "Failed to square off all positions." });
+  }
+});
+
+// 3. Convert Position (MIS <-> CNC/NRML)
+app.post("/convertPosition", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const { positionId, targetProduct } = req.body;
+    const position = await PositionsModel.findOne({ _id: positionId, userId });
+    if (!position || position.qty === 0) {
+      return res.status(400).json({ success: false, message: "Active open position required to convert." });
+    }
+
+    const currentProduct = (position.product || "MIS").toUpperCase();
+    const desiredProduct = (targetProduct || (currentProduct === "MIS" ? "CNC" : "MIS")).toUpperCase();
+
+    if (currentProduct === desiredProduct) {
+      return res.status(400).json({ success: false, message: `Position is already ${currentProduct}.` });
+    }
+
+    const sym = position.instrument || position.name;
+    const qty = Math.abs(position.qty);
+    const avg = position.avg;
+    const orderCost = qty * avg;
+    const funds = await getOrCreateUserFunds(userId);
+
+    if (currentProduct === "MIS" && (desiredProduct === "CNC" || desiredProduct === "NRML")) {
+      // MIS (20%) -> CNC/NRML (100%): Requires additional 80% margin!
+      const additionalMarginRequired = orderCost * 0.8;
+      let currentAvailable = parseFloat(funds?.equity?.availableMargin?.replace(/,/g, "") || "0");
+
+      if (currentAvailable < additionalMarginRequired) {
+        return res.status(400).json({
+          success: false,
+          code: "INSUFFICIENT_MARGIN",
+          message: `Cannot convert to ${desiredProduct}! Insufficient cash margin. Additional required: ₹${formatIndianCurrency(additionalMarginRequired)}, Available: ₹${formatIndianCurrency(currentAvailable)}.`,
+        });
+      }
+
+      currentAvailable -= additionalMarginRequired;
+      let currentUsed = parseFloat(funds.equity.usedMargin.replace(/,/g, "")) || 0;
+      currentUsed += additionalMarginRequired;
+
+      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
+      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
+      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
+      await funds.save();
+
+      // If converting to CNC, also mirror into Demat HoldingsModel if long
+      if (desiredProduct === "CNC" && position.qty > 0) {
+        let holding = await HoldingsModel.findOne({ userId, $or: [{ name: sym }, { instrument: sym }] });
+        if (holding) {
+          const totalShares = holding.qty + qty;
+          const totalCost = holding.qty * (holding.avg || holding.price) + qty * avg;
+          holding.avg = Number((totalCost / totalShares).toFixed(2));
+          holding.qty = totalShares;
+          holding.curVal = Number((totalShares * (position.ltp || avg)).toFixed(2));
+          await holding.save();
+        } else {
+          holding = new HoldingsModel({
+            userId,
+            name: sym,
+            instrument: sym,
+            qty,
+            avg,
+            avgCost: avg,
+            price: avg,
+            ltp: position.ltp || avg,
+            curVal: Number((qty * (position.ltp || avg)).toFixed(2)),
+            pnl: 0,
+            net: "+0.00%",
+            day: "+0.00%",
+            isProfit: true,
+          });
+          await holding.save();
+        }
+      }
+    } else if ((currentProduct === "CNC" || currentProduct === "NRML") && desiredProduct === "MIS") {
+      // CNC (100%) -> MIS (20%): Releases 80% margin back to available cash!
+      const releasedMargin = orderCost * 0.8;
+      let currentAvailable = parseFloat(funds?.equity?.availableMargin?.replace(/,/g, "") || "0");
+      let currentUsed = parseFloat(funds?.equity?.usedMargin?.replace(/,/g, "")) || 0;
+
+      currentAvailable += releasedMargin;
+      currentUsed = Math.max(0, currentUsed - releasedMargin);
+
+      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
+      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
+      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
+      await funds.save();
+
+      // Remove from holdings if it came from CNC
+      if (currentProduct === "CNC") {
+        let holding = await HoldingsModel.findOne({ userId, $or: [{ name: sym }, { instrument: sym }] });
+        if (holding) {
+          holding.qty = Math.max(0, holding.qty - qty);
+          if (holding.qty === 0) {
+            await HoldingsModel.deleteOne({ _id: holding._id });
+          } else {
+            await holding.save();
+          }
+        }
+      }
+    }
+
+    position.product = desiredProduct;
+    position.convertedAt = new Date();
+    await position.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "TRADE",
+        title: `Position Converted: ${sym}`,
+        description: `Successfully converted ${qty} ${sym} from ${currentProduct} to ${desiredProduct}.`,
+        status: "SUCCESS",
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: `Position in ${sym} successfully converted from ${currentProduct} to ${desiredProduct}!`,
+      position,
+    });
+  } catch (error) {
+    console.error("Error converting position:", error);
+    res.status(500).json({ success: false, message: "Failed to convert position." });
+  }
+});
+
 app.get("/allOrders", async (req, res) => {
   try {
-    const allOrders = await OrdersModel.find({}).sort({ createdAt: -1 });
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(200).json([]);
+    }
+    const allOrders = await OrdersModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(allOrders);
   } catch (error) {
     console.error("Error fetching orders:", error);
@@ -507,7 +887,7 @@ app.get("/allOrders", async (req, res) => {
 
 // Dynamic Real-Time Notification Dispatcher
 async function createNotification({
-  userId = "ZU9344",
+  userId,
   type = "ORDER",
   category = "EXECUTION",
   title,
@@ -536,22 +916,10 @@ async function createNotification({
   }
 }
 
-// Unified Order Execution Helper
-async function executeOrderInternal({ name, qty, price, mode = "BUY", product = "CNC", userId = "ZU9344" }) {
-  const numQty = Number(qty);
-  const numPrice = Number(price);
-
-  if (!name || isNaN(numQty) || numQty <= 0 || isNaN(numPrice) || numPrice <= 0) {
-    return { success: false, message: "Valid instrument name, positive quantity, and price are required." };
-  }
-
-  const orderMode = mode.toUpperCase();
-  const orderProduct = product.toUpperCase();
-  const orderCost = numQty * numPrice;
-  const marginRequired = orderProduct === "MIS" ? orderCost * 0.2 : orderCost;
-
+// Helper: Strictly isolate user funds per tenant/user account
+async function getOrCreateUserFunds(userId) {
+  if (!userId) return null;
   let funds = await FundsModel.findOne({ userId });
-  if (!funds) funds = await FundsModel.findOne({});
   if (!funds) {
     funds = new FundsModel({
       userId,
@@ -561,8 +929,84 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
         availableCash: "1,24,500.00",
         openingBalance: "1,24,500.00",
       },
+      commodity: {
+        availableMargin: "0.00",
+        usedMargin: "0.00",
+        availableCash: "0.00",
+        openingBalance: "0.00",
+      },
     });
     await funds.save();
+    console.log(`💰 [USER FUNDS INITIALIZED] Initialized fresh margin for user: ${userId}`);
+  }
+  return funds;
+}
+
+// Unified Order Execution Helper
+async function executeOrderInternal({ name, qty, price, mode = "BUY", product = "CNC", userId }) {
+  const numQty = Number(qty);
+  const numPrice = Number(price);
+
+  if (!name || isNaN(numQty) || numQty <= 0 || isNaN(numPrice) || numPrice <= 0) {
+    return { success: false, message: "Valid instrument name, positive quantity, and price are required." };
+  }
+
+  // 🛡️ Pre-Trade Risk Engine: Segments & Kill Switch Enforcement
+  try {
+    const userDoc = await UserModel.findOne({ userId });
+    if (userDoc && userDoc.segments) {
+      let requiredSegment = "equity";
+      const upperName = (name || "").toUpperCase();
+      if (
+        upperName.includes(" FUT") ||
+        upperName.includes(" CE") ||
+        upperName.includes(" PE") ||
+        (upperName.includes("NIFTY") && (upperName.includes("OPT") || upperName.includes("FUT")))
+      ) {
+        requiredSegment = "futuresAndOptions";
+      } else if (
+        upperName.includes("CRUDEOIL") ||
+        upperName.includes("GOLD") ||
+        upperName.includes("SILVER") ||
+        upperName.includes("NATURALGAS") ||
+        upperName.includes("MCX")
+      ) {
+        requiredSegment = "commodity";
+      } else if (
+        upperName.includes("USDINR") ||
+        upperName.includes("EURINR") ||
+        upperName.includes("GBPINR") ||
+        upperName.includes("JPYINR")
+      ) {
+        requiredSegment = "currency";
+      }
+
+      const segConfig = userDoc.segments[requiredSegment];
+      if (segConfig && segConfig.active === false) {
+        const segDisplayName = segConfig.name || requiredSegment;
+        return {
+          success: false,
+          code: "SEGMENT_DISABLED",
+          message: `Order rejected! Trading in "${segDisplayName}" is disabled under your Risk Settings / Kill Switch.`,
+        };
+      }
+    }
+  } catch (segErr) {
+    console.warn("Segment validation warning:", segErr.message);
+  }
+
+  const orderMode = mode.toUpperCase();
+  const orderProduct = product.toUpperCase();
+  const orderCost = numQty * numPrice;
+  const marginRequired = orderProduct === "MIS" ? orderCost * 0.2 : orderCost;
+
+  let funds = await getOrCreateUserFunds(userId);
+  if (!funds) {
+    return {
+      success: false,
+      code: "FUNDS_UNAVAILABLE",
+      message: "Unable to retrieve or initialize trading funds for this user account.",
+    };
   }
 
   let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
@@ -586,6 +1030,7 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
 
     if (orderProduct === "CNC") {
       let existingHolding = await HoldingsModel.findOne({
+        userId,
         $or: [{ name }, { instrument: name }],
       });
 
@@ -625,22 +1070,53 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
       }
     } else {
       let existingPosition = await PositionsModel.findOne({
+        userId,
         $or: [{ name }, { instrument: name }],
-        product: "MIS",
+        product: orderProduct,
       });
 
       if (existingPosition) {
-        const totalShares = existingPosition.qty + numQty;
-        const totalCost = existingPosition.qty * (existingPosition.avg || existingPosition.price) + numQty * numPrice;
-        existingPosition.avg = Number((totalCost / totalShares).toFixed(2));
-        existingPosition.qty = totalShares;
-        existingPosition.price = numPrice;
-        existingPosition.ltp = numPrice;
+        if (existingPosition.qty === 0) {
+          existingPosition.qty = numQty;
+          existingPosition.avg = numPrice;
+          existingPosition.price = numPrice;
+          existingPosition.ltp = numPrice;
+          existingPosition.status = "OPEN";
+          existingPosition.closedAt = null;
+        } else if (existingPosition.qty > 0) {
+          const totalShares = existingPosition.qty + numQty;
+          const totalCost = existingPosition.qty * (existingPosition.avg || existingPosition.price) + numQty * numPrice;
+          existingPosition.avg = Number((totalCost / totalShares).toFixed(2));
+          existingPosition.qty = totalShares;
+          existingPosition.price = numPrice;
+          existingPosition.ltp = numPrice;
+          existingPosition.status = "OPEN";
+          existingPosition.closedAt = null;
+        } else {
+          // Covering short position
+          const netQty = existingPosition.qty + numQty;
+          if (netQty > 0) {
+            existingPosition.avg = numPrice;
+            existingPosition.qty = netQty;
+            existingPosition.status = "OPEN";
+            existingPosition.closedAt = null;
+          } else if (netQty === 0) {
+            existingPosition.qty = 0;
+            existingPosition.status = "CLOSED";
+            existingPosition.closedAt = new Date();
+          } else {
+            existingPosition.qty = netQty;
+            existingPosition.status = "OPEN";
+            existingPosition.closedAt = null;
+          }
+          existingPosition.price = numPrice;
+          existingPosition.ltp = numPrice;
+        }
         await existingPosition.save();
       } else {
         const newPosition = new PositionsModel({
           userId,
-          product: "MIS",
+          product: orderProduct || "MIS",
           name,
           instrument: name,
           qty: numQty,
@@ -653,6 +1129,8 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
           chg: "+0.00%",
           isLoss: false,
           isProfit: true,
+          status: "OPEN",
+          closedAt: null,
         });
         await newPosition.save();
       }
@@ -660,6 +1138,7 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
   } else if (orderMode === "SELL") {
     if (orderProduct === "CNC") {
       let existingHolding = await HoldingsModel.findOne({
+        userId,
         $or: [{ name }, { instrument: name }],
       });
 
@@ -689,17 +1168,63 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
       await funds.save();
     } else {
       let existingPosition = await PositionsModel.findOne({
+        userId,
         $or: [{ name }, { instrument: name }],
-        product: "MIS",
+        product: orderProduct,
       });
 
       if (existingPosition) {
-        existingPosition.qty = Math.max(0, existingPosition.qty - numQty);
-        if (existingPosition.qty === 0) {
-          await PositionsModel.deleteOne({ _id: existingPosition._id });
+        if (existingPosition.qty > 0) {
+          const netQty = existingPosition.qty - numQty;
+          if (netQty === 0) {
+            existingPosition.qty = 0;
+            existingPosition.status = "CLOSED";
+            existingPosition.closedAt = new Date();
+          } else if (netQty > 0) {
+            existingPosition.qty = netQty;
+            existingPosition.status = "OPEN";
+            existingPosition.closedAt = null;
+          } else {
+            // Flipped to short
+            existingPosition.avg = numPrice;
+            existingPosition.qty = netQty;
+            existingPosition.status = "OPEN";
+            existingPosition.closedAt = null;
+          }
         } else {
-          await existingPosition.save();
+          // Already short or 0, increase short position
+          const priorShares = Math.abs(existingPosition.qty);
+          const totalShares = priorShares + numQty;
+          const totalCost = priorShares * (existingPosition.avg || existingPosition.price) + numQty * numPrice;
+          existingPosition.avg = Number((totalCost / totalShares).toFixed(2));
+          existingPosition.qty = -totalShares;
+          existingPosition.status = "OPEN";
+          existingPosition.closedAt = null;
         }
+        existingPosition.price = numPrice;
+        existingPosition.ltp = numPrice;
+        await existingPosition.save();
+      } else {
+        // New Short Intraday / Overnight Position
+        const newPosition = new PositionsModel({
+          userId,
+          product: orderProduct || "MIS",
+          name,
+          instrument: name,
+          qty: -numQty,
+          avg: numPrice,
+          price: numPrice,
+          ltp: numPrice,
+          pnl: 0,
+          net: "+0.00%",
+          day: "+0.00%",
+          chg: "+0.00%",
+          isLoss: false,
+          isProfit: true,
+          status: "OPEN",
+          closedAt: null,
+        });
+        await newPosition.save();
       }
 
       currentAvailable += marginRequired;
@@ -763,7 +1288,8 @@ const formatIndianCurrency = (num) => {
 // 1. Transactional Order Engine with Portfolio & Funds Synchronization
 app.post("/newOrder", async (req, res) => {
   try {
-    const { name, qty, price, mode = "BUY", product = "CNC", userId = "ZU9344" } = req.body;
+    const { name, qty, price, mode = "BUY", product = "CNC" } = req.body;
+    const userId = getAuthenticatedUserId(req);
     const result = await executeOrderInternal({ name, qty, price, mode, product, userId });
     if (!result.success) {
       return res.status(400).json(result);
@@ -809,36 +1335,61 @@ const defaultTab1Stocks = [
   { symbol: "SUNPHARMA", name: "Sun Pharmaceutical", exchange: "NSE", sector: "Healthcare", price: 1782.30, change: 14.20, percent: "+0.80%", isDown: false },
 ];
 
-// GET /masterInstruments - Omnisearch across catalog
-app.get("/masterInstruments", (req, res) => {
+// GET /masterInstruments - Omnisearch across catalog (Stored in & Fetched from MongoDB Atlas!)
+app.get("/masterInstruments", async (req, res) => {
   try {
-    const q = (req.query.q || "").trim().toLowerCase();
-    const sector = (req.query.sector || "").trim().toLowerCase();
+    const q = (req.query.q || "").trim();
+    const sector = (req.query.sector || "").trim();
     const limit = parseInt(req.query.limit) || 50;
 
-    let results = masterInstruments;
+    const query = {};
     if (sector) {
-      results = results.filter((item) => (item.sector || "").toLowerCase() === sector);
+      query.sector = new RegExp("^" + sector + "$", "i");
     }
     if (q) {
-      results = results.filter((item) => {
-        const sym = (item.symbol || "").toLowerCase();
-        const nm = (item.name || "").toLowerCase();
-        return sym.includes(q) || nm.includes(q);
-      });
+      query.$or = [
+        { symbol: new RegExp(q, "i") },
+        { name: new RegExp(q, "i") },
+      ];
     }
 
-    return res.status(200).json(results.slice(0, limit));
+    let results = await InstrumentModel.find(query).limit(limit).lean();
+    if (!results || results.length === 0) {
+      let fallback = masterInstruments;
+      if (sector) fallback = fallback.filter((item) => (item.sector || "").toLowerCase() === sector.toLowerCase());
+      if (q) {
+        const lowerQ = q.toLowerCase();
+        fallback = fallback.filter(
+          (item) => (item.symbol || "").toLowerCase().includes(lowerQ) || (item.name || "").toLowerCase().includes(lowerQ)
+        );
+      }
+      results = fallback.slice(0, limit);
+    }
+
+    return res.status(200).json(results);
   } catch (error) {
-    console.error("Error searching master instruments:", error);
+    console.error("Error searching master instruments in DB:", error);
     return res.status(500).json({ error: "Failed to search master instruments" });
+  }
+});
+
+// GET /allInstruments - Complete 104 master instruments catalog with live prices
+app.get("/allInstruments", async (req, res) => {
+  try {
+    let results = await InstrumentModel.find({}).lean();
+    if (!results || results.length === 0) {
+      results = masterInstruments;
+    }
+    return res.status(200).json(results);
+  } catch (error) {
+    return res.status(200).json(masterInstruments);
   }
 });
 
 // GET /userWatchlistTabs - Get all 7 tabs metadata (id, name, stock count)
 app.get("/userWatchlistTabs", async (req, res) => {
   try {
-    const userId = req.query.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     const existing = await UserWatchlistModel.find({ userId });
     const tabMap = {};
     existing.forEach((t) => {
@@ -884,7 +1435,7 @@ app.get("/userWatchlistTabs", async (req, res) => {
 // GET /userWatchlist - Get a specific tab's stocks and metadata
 app.get("/userWatchlist", async (req, res) => {
   try {
-    const userId = req.query.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     const tabId = parseInt(req.query.tabId) || 1;
 
     let tabDoc = await UserWatchlistModel.findOne({ userId, tabId });
@@ -918,7 +1469,8 @@ app.get("/userWatchlist", async (req, res) => {
 // POST /addWatchlistStock - Add a stock to active tab
 app.post("/addWatchlistStock", async (req, res) => {
   try {
-    const { userId = "ZU9344", tabId = 1, stock } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { tabId = 1, stock } = req.body;
     if (!stock || !stock.symbol) {
       return res.status(400).json({ success: false, message: "Valid stock object is required" });
     }
@@ -974,7 +1526,8 @@ app.post("/addWatchlistStock", async (req, res) => {
 // POST /removeWatchlistStock - Remove a stock from active tab
 app.post("/removeWatchlistStock", async (req, res) => {
   try {
-    const { userId = "ZU9344", tabId = 1, symbol } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { tabId = 1, symbol } = req.body;
     if (!symbol) {
       return res.status(400).json({ success: false, message: "Symbol is required" });
     }
@@ -1001,7 +1554,8 @@ app.post("/removeWatchlistStock", async (req, res) => {
 // POST /renameWatchlistTab - Rename a watchlist tab
 app.post("/renameWatchlistTab", async (req, res) => {
   try {
-    const { userId = "ZU9344", tabId = 1, tabName } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { tabId = 1, tabName } = req.body;
     const cleanName = (tabName || "").trim();
     if (!cleanName) {
       return res.status(400).json({ success: false, message: "Watchlist name cannot be empty" });
@@ -1034,26 +1588,11 @@ app.post("/renameWatchlistTab", async (req, res) => {
 
 app.get("/userFunds", async (req, res) => {
   try {
-    const userId = req.query.userId;
-    let funds = null;
-    if (userId) {
-      funds = await FundsModel.findOne({ userId });
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) {
+      return res.status(400).json({ error: "User ID is required to fetch funds" });
     }
-    if (!funds) {
-      funds = await FundsModel.findOne({});
-    }
-    if (!funds) {
-      funds = new FundsModel({
-        userId: userId || "ZU9344",
-        equity: {
-          availableMargin: "1,24,500.00",
-          usedMargin: "42,180.00",
-          availableCash: "1,24,500.00",
-          openingBalance: "1,66,680.00",
-        },
-      });
-      await funds.save();
-    }
+    const funds = await getOrCreateUserFunds(userId);
     res.status(200).json(funds);
   } catch (error) {
     console.error("Error fetching funds:", error);
@@ -1308,7 +1847,7 @@ app.get("/getNominee", async (req, res) => {
 
 app.get("/allGtt", async (req, res) => {
   try {
-    const userId = req.query.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     const gtts = await GttModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(gtts);
   } catch (error) {
@@ -1320,7 +1859,7 @@ app.get("/allGtt", async (req, res) => {
 app.post("/newGtt", async (req, res) => {
   try {
     const {
-      userId = "ZU9344",
+      userId = getAuthenticatedUserId(req),
       symbol,
       exchange = "NSE",
       type = "SINGLE",
@@ -1444,9 +1983,138 @@ app.post("/triggerGtt", async (req, res) => {
 // Phase 4: Basket Orders Engine
 // ==========================================
 
+const strategyBasketTemplates = [
+  {
+    code: "TMPL_NIFTY_IT",
+    name: "Nifty IT Trio",
+    category: "Sector Growth",
+    description: "Core market-cap weighted allocation in India's top 3 IT outsourcing powerhouses.",
+    tag: "High Growth",
+    items: [
+      { symbol: "INFY", name: "Infosys Ltd.", mode: "BUY", product: "CNC", qty: 5, price: 1845.50 },
+      { symbol: "TCS", name: "Tata Consultancy Services", mode: "BUY", product: "CNC", qty: 2, price: 3982.75 },
+      { symbol: "WIPRO", name: "Wipro Ltd.", mode: "BUY", product: "CNC", qty: 15, price: 546.80 },
+    ],
+    marginRequired: 25395.00,
+  },
+  {
+    code: "TMPL_BANKING_TITANS",
+    name: "Banking Titans",
+    category: "Financials",
+    description: "Pillars of Indian credit expansion covering premier private and PSU banking lenders.",
+    tag: "Bluechip",
+    items: [
+      { symbol: "HDFCBANK", name: "HDFC Bank Ltd.", mode: "BUY", product: "CNC", qty: 8, price: 1728.15 },
+      { symbol: "ICICIBANK", name: "ICICI Bank Ltd.", mode: "BUY", product: "CNC", qty: 6, price: 1242.00 },
+      { symbol: "SBIN", name: "State Bank of India", mode: "BUY", product: "CNC", qty: 12, price: 814.65 },
+    ],
+    marginRequired: 31053.00,
+  },
+  {
+    code: "TMPL_ALL_WEATHER",
+    name: "All-Weather Balanced Wealth",
+    category: "Multi-Asset",
+    description: "Portfolio combining Nifty 50 equity benchmark with Sovereign Gold hedge.",
+    tag: "Low Risk",
+    items: [
+      { symbol: "NIFTYBEES", name: "Nippon India Nifty 50 BeES ETF", mode: "BUY", product: "CNC", qty: 25, price: 264.50 },
+      { symbol: "GOLDBEES", name: "Nippon India ETF Gold BeES", mode: "BUY", product: "CNC", qty: 30, price: 68.50 },
+    ],
+    marginRequired: 8667.50,
+  },
+  {
+    code: "TMPL_AUTO_MOMENTUM",
+    name: "Automobile Momentum",
+    category: "Consumption",
+    description: "Riding the EV transition, domestic passenger vehicle demand, and commercial vehicle cycles.",
+    tag: "Momentum",
+    items: [
+      { symbol: "TATAMOTORS", name: "Tata Motors Ltd.", mode: "BUY", product: "CNC", qty: 10, price: 884.20 },
+      { symbol: "MARUTI", name: "Maruti Suzuki India", mode: "BUY", product: "CNC", qty: 1, price: 11240.50 },
+    ],
+    marginRequired: 20082.50,
+  },
+  {
+    code: "TMPL_INFRA_POWER",
+    name: "Energy & Infrastructure",
+    category: "Infra & Energy",
+    description: "Strategic investment in India's logistics gateways, retail telecom, and energy revolution.",
+    tag: "Capex Cycle",
+    items: [
+      { symbol: "RELIANCE", name: "Reliance Industries Ltd.", mode: "BUY", product: "CNC", qty: 4, price: 2712.40 },
+      { symbol: "ADANIPORTS", name: "Adani Ports & SEZ Ltd.", mode: "BUY", product: "CNC", qty: 6, price: 1340.00 },
+    ],
+    marginRequired: 18889.60,
+  },
+  {
+    code: "TMPL_FMCG_SHIELD",
+    name: "FMCG Cash Flow Shield",
+    category: "Defensive",
+    description: "Essential consumer staples with bulletproof balance sheets and consistent high dividend yield.",
+    tag: "High Dividend",
+    items: [
+      { symbol: "ITC", name: "ITC Ltd.", mode: "BUY", product: "CNC", qty: 25, price: 478.40 },
+      { symbol: "HINDUNILVR", name: "Hindustan Unilever Ltd.", mode: "BUY", product: "CNC", qty: 3, price: 2382.40 },
+    ],
+    marginRequired: 19107.20,
+  },
+];
+
+app.get("/basketTemplates", (req, res) => {
+  res.status(200).json(strategyBasketTemplates);
+});
+
+app.post("/addTemplateToBaskets", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required." });
+    }
+    const { templateCode } = req.body;
+    const tmpl = strategyBasketTemplates.find((t) => t.code === templateCode);
+    if (!tmpl) {
+      return res.status(404).json({ success: false, message: "Strategy template not found." });
+    }
+
+    const newBasket = new BasketModel({
+      userId,
+      name: tmpl.name,
+      items: tmpl.items.map((i) => ({
+        symbol: i.symbol,
+        mode: i.mode || "BUY",
+        product: i.product || "CNC",
+        qty: i.qty || 1,
+        price: i.price || 100,
+        orderType: "MARKET",
+      })),
+      marginRequired: tmpl.marginRequired,
+    });
+
+    const saved = await newBasket.save();
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "EXECUTION",
+        title: `Strategy Basket Added - ${tmpl.name}`,
+        description: `Strategy template "${tmpl.name}" with ${tmpl.items.length} order legs added to your baskets.`,
+        metadata: { actionUrl: "/orders" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({ success: true, message: `"${tmpl.name}" added to your Demat baskets!`, basket: saved });
+  } catch (err) {
+    console.error("Error adding template to baskets:", err);
+    res.status(500).json({ success: false, message: "Failed to add strategy basket." });
+  }
+});
+
 app.get("/allBaskets", async (req, res) => {
   try {
-    const userId = req.query.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(200).json([]);
+    }
     let baskets = await BasketModel.find({ userId }).sort({ createdAt: -1 });
 
     // Auto-seed default baskets for user if empty so they have realistic dynamic constituents
@@ -1485,7 +2153,8 @@ app.get("/allBaskets", async (req, res) => {
 
 app.post("/saveBasket", async (req, res) => {
   try {
-    const { id, userId = "ZU9344", name, items = [] } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { id, name, items = [] } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ success: false, message: "Basket name is required." });
     }
@@ -1539,7 +2208,8 @@ app.delete("/deleteBasket/:id", async (req, res) => {
 
 app.post("/executeBasket", async (req, res) => {
   try {
-    const { userId = "ZU9344", items = [], basketName = "Basket" } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { items = [], basketName = "Basket" } = req.body;
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ success: false, message: "Basket contains no orders to execute." });
     }
@@ -1557,8 +2227,7 @@ app.post("/executeBasket", async (req, res) => {
     }
 
     // 2. Check total margin against user's funds
-    let funds = await FundsModel.findOne({ userId });
-    if (!funds) funds = await FundsModel.findOne({});
+    let funds = await getOrCreateUserFunds(userId);
     const currentAvailable = parseFloat(funds?.equity?.availableMargin?.replace(/,/g, "") || "0");
 
     if (currentAvailable < totalMarginRequired) {
@@ -1623,7 +2292,7 @@ app.post("/executeBasket", async (req, res) => {
 // 1. Fetch user notifications with optional category filtering
 app.get("/notifications", async (req, res) => {
   try {
-    const userId = req.query.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     const limit = parseInt(req.query.limit) || 50;
     const type = req.query.type;
     const unreadOnly = req.query.unreadOnly === "true";
@@ -1650,7 +2319,7 @@ app.get("/notifications", async (req, res) => {
 // 2. High-speed unread count aggregation
 app.get("/notifications/unreadCount", async (req, res) => {
   try {
-    const userId = req.query.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     const unreadCount = await NotificationModel.countDocuments({ userId, unread: true });
     res.status(200).json({ unreadCount });
   } catch (error) {
@@ -1678,7 +2347,7 @@ app.patch("/notifications/:id/read", async (req, res) => {
 // 4. Mark all notifications as read (Atomic bulk update)
 app.post("/notifications/markAllRead", async (req, res) => {
   try {
-    const userId = req.body.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     await NotificationModel.updateMany({ userId, unread: true }, { $set: { unread: false } });
     res.status(200).json({ success: true, message: "All notifications marked as read." });
   } catch (error) {
@@ -1702,7 +2371,7 @@ app.delete("/notifications/:id", async (req, res) => {
 // 6. Clear all notifications
 app.post("/notifications/clearAll", async (req, res) => {
   try {
-    const userId = req.body.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     await NotificationModel.deleteMany({ userId });
     res.status(200).json({ success: true, message: "All notifications cleared." });
   } catch (error) {
@@ -1714,12 +2383,9 @@ app.post("/notifications/clearAll", async (req, res) => {
 // 7. Dynamic Funds deposit endpoint with automatic ledger & notification synchronization
 app.post("/addFunds", async (req, res) => {
   try {
-    const { userId = "ZU9344", amount = 10000, method = "UPI" } = req.body;
-    let funds = await FundsModel.findOne({ userId });
-    if (!funds) funds = await FundsModel.findOne({});
-    if (!funds) {
-      funds = new FundsModel({ userId });
-    }
+    const userId = getAuthenticatedUserId(req);
+    const { amount = 10000, method = "UPI" } = req.body;
+    let funds = await getOrCreateUserFunds(userId);
     const numAmount = parseFloat(amount);
     let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
     currentAvailable += numAmount;
@@ -1755,7 +2421,8 @@ app.post("/addFunds", async (req, res) => {
 // 8. Test notification trigger (for rapid dev testing / simulation)
 app.post("/notifications/test", async (req, res) => {
   try {
-    const { userId = "ZU9344", type = "ORDER", title, description, metadata } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { type = "ORDER", title, description, metadata } = req.body;
     const notification = await createNotification({
       userId,
       type,
@@ -1778,8 +2445,11 @@ app.post("/notifications/test", async (req, res) => {
 // 1. Submit IPO Application & Dispatch Live Email UPI Mandate
 app.post("/applyIpo", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "userId is required to apply for IPO" });
+    }
     const {
-      userId = "ZU9344",
       userEmail,
       ipoSymbol,
       companyName,
@@ -1928,7 +2598,7 @@ app.post("/applyIpo", async (req, res) => {
 // 2. Fetch User's Submitted IPO Applications
 app.get("/myIpoApplications", async (req, res) => {
   try {
-    const userId = req.query.userId || "ZU9344";
+    const userId = getAuthenticatedUserId(req);
     const applications = await IpoApplicationModel.find({ userId }).sort({ appliedAt: -1 });
     res.status(200).json(applications);
   } catch (error) {
@@ -2110,6 +2780,1904 @@ app.delete("/cancelIpoApplication/:id", async (req, res) => {
     res.status(200).json({ success: true, message: "IPO application cancelled successfully" });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to cancel IPO application" });
+  }
+});
+
+// 5. Modify Existing IPO Bid (Lots / Price / Cut-off / UPI)
+app.put("/modifyIpoBid/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { lots, bidPrice, isCutOff, upiId } = req.body;
+
+    const appDoc = await IpoApplicationModel.findById(id);
+    if (!appDoc) {
+      return res.status(404).json({ success: false, message: "IPO application not found." });
+    }
+
+    if (appDoc.status === "CANCELLED") {
+      return res.status(400).json({ success: false, message: "Cancelled applications cannot be modified. Please submit a new bid." });
+    }
+
+    const numLots = Math.max(1, parseInt(lots) || appDoc.lots);
+    const numLotSize = appDoc.lotSize || 1;
+    const numTotalQty = numLots * numLotSize;
+    const numBidPrice = parseFloat(bidPrice) || appDoc.bidPrice;
+    const newTotalAmount = Number((numTotalQty * numBidPrice).toFixed(2));
+
+    // SEBI Category Retail Check
+    if (appDoc.investorCategory === "INDIVIDUAL" && newTotalAmount > 200000) {
+      return res.status(400).json({
+        success: false,
+        message: "Retail investment cannot exceed ₹2,00,000 under SEBI ASBA rules. Switch to HNI for higher allocations.",
+      });
+    }
+
+    appDoc.lots = numLots;
+    appDoc.bidPrice = numBidPrice;
+    appDoc.isCutOff = isCutOff !== undefined ? isCutOff : appDoc.isCutOff;
+    appDoc.totalQty = numTotalQty;
+    appDoc.totalAmount = newTotalAmount;
+    if (upiId && upiId.trim()) {
+      appDoc.upiId = upiId.trim();
+    }
+    appDoc.status = "APPLIED";
+    appDoc.mandateStatus = "ACCEPTED";
+    await appDoc.save();
+
+    try {
+      await createNotification({
+        userId: appDoc.userId,
+        type: "COMPLIANCE",
+        category: "IPO",
+        title: `IPO Bid Modified - ${appDoc.companyName}`,
+        description: `Bid updated to ${numLots} Lot (${numTotalQty} shares) @ ₹${numBidPrice}. New ASBA blocked lien: ₹${newTotalAmount.toLocaleString("en-IN")}.`,
+        metadata: { symbol: appDoc.ipoSymbol, actionUrl: "/bids" },
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: `IPO application for ${appDoc.companyName} modified successfully!`,
+      application: appDoc,
+    });
+  } catch (error) {
+    console.error("Error modifying IPO bid:", error);
+    res.status(500).json({ success: false, message: "Failed to modify IPO application." });
+  }
+});
+
+// ============================================================================
+// GOVT. SECURITIES (G-SEC & T-BILLS) NON-COMPETITIVE BIDDING DESK
+// ============================================================================
+
+const curatedGsecs = [
+  {
+    symbol: "91D_TBILL",
+    name: "91-Day Treasury Bill (RBI Auction)",
+    category: "T-BILL",
+    yield: "6.82% p.a.",
+    biddingRange: "Live till 17:00 IST",
+    pricePerUnit: 1000,
+    minQty: 10,
+    minAmount: "₹10,000",
+    settlementDate: "T+1 Clearing",
+    maturityDate: "91 Days from Allotment",
+    status: "Bidding Open",
+  },
+  {
+    symbol: "182D_TBILL",
+    name: "182-Day Treasury Bill (RBI Auction)",
+    category: "T-BILL",
+    yield: "6.98% p.a.",
+    biddingRange: "Live till 17:00 IST",
+    pricePerUnit: 1000,
+    minQty: 10,
+    minAmount: "₹10,000",
+    settlementDate: "T+1 Clearing",
+    maturityDate: "182 Days from Allotment",
+    status: "Bidding Open",
+  },
+  {
+    symbol: "364D_TBILL",
+    name: "364-Day Treasury Bill (RBI Auction)",
+    category: "T-BILL",
+    yield: "7.05% p.a.",
+    biddingRange: "Live till 17:00 IST",
+    pricePerUnit: 1000,
+    minQty: 10,
+    minAmount: "₹10,000",
+    settlementDate: "T+1 Clearing",
+    maturityDate: "364 Days from Allotment",
+    status: "Bidding Open",
+  },
+  {
+    symbol: "GS2033_718",
+    name: "7.18% GS 2033 (10-Yr Benchmark Govt Bond)",
+    category: "G-SEC",
+    yield: "7.18% p.a.",
+    biddingRange: "Live till 17:00 IST",
+    pricePerUnit: 1000,
+    minQty: 10,
+    minAmount: "₹10,000",
+    settlementDate: "Semi-Annual Coupon",
+    maturityDate: "15 Oct 2033",
+    status: "Bidding Open",
+  },
+  {
+    symbol: "SGB_2024_25",
+    name: "Sovereign Gold Bond (2024-25 Series)",
+    category: "SGB",
+    yield: "2.50% p.a. + Gold Returns",
+    biddingRange: "RBI Issue Window",
+    pricePerUnit: 6260,
+    minQty: 1,
+    minAmount: "₹6,260",
+    settlementDate: "RBI Sovereign Guarantee",
+    maturityDate: "8 Years (Exit option after 5th yr)",
+    status: "Bidding Open",
+  },
+];
+
+app.get("/allGsecs", async (req, res) => {
+  res.status(200).json(curatedGsecs);
+});
+
+app.post("/applyGsecBid", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const { symbol, instrumentName, units, pricePerUnit, category, indicativeYield } = req.body;
+    const numUnits = Math.max(1, parseInt(units) || 10);
+    const numPrice = parseFloat(pricePerUnit) || 1000;
+    const totalAmount = numUnits * numPrice;
+
+    const bidNumber = `GSEC-${new Date().getFullYear()}-${symbol}-${Math.floor(10000 + Math.random() * 90000)}`;
+
+    const newBid = new GsecBidModel({
+      userId,
+      symbol,
+      instrumentName,
+      category: category || "T-BILL",
+      units: numUnits,
+      indicativeYield: indicativeYield || "7.05%",
+      pricePerUnit: numPrice,
+      totalAmount,
+      status: "BID_PLACED",
+      bidNumber,
+    });
+    await newBid.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "GSEC",
+        title: `RBI Bidding Placed - ${symbol}`,
+        description: `Non-competitive bid for ${numUnits} units of ${instrumentName} (₹${totalAmount.toLocaleString("en-IN")}) placed successfully.`,
+        metadata: { symbol, actionUrl: "/bids" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `G-Sec / T-Bill non-competitive bid for ${instrumentName} placed successfully!`,
+      bid: newBid,
+    });
+  } catch (error) {
+    console.error("Error applying G-Sec bid:", error);
+    res.status(500).json({ success: false, message: "Failed to place G-Sec bid." });
+  }
+});
+
+app.get("/myGsecApplications", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) return res.status(200).json([]);
+    const bids = await GsecBidModel.find({ userId }).sort({ createdAt: -1 });
+    res.status(200).json(bids);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch user G-Sec bids" });
+  }
+});
+
+// ============================================================================
+// CORPORATE ACTIONS & SHARE BUYBACKS TENDER DESK
+// ============================================================================
+
+const curatedCorporateActions = [
+  {
+    symbol: "TCS",
+    companyName: "Tata Consultancy Services Ltd.",
+    actionType: "BUYBACK",
+    tenderPrice: 4150.00,
+    currentMarketPrice: 3982.75,
+    premiumPercent: "+4.20%",
+    issueSize: "₹17,000 Cr",
+    windowDates: "10 Nov - 22 Nov 2024",
+    status: "Tender Open",
+    description: "Tender offer share buyback through proportionate tender offer route.",
+  },
+  {
+    symbol: "WIPRO",
+    companyName: "Wipro Limited",
+    actionType: "BUYBACK",
+    tenderPrice: 445.00,
+    currentMarketPrice: 546.80,
+    premiumPercent: "Tender Offer",
+    issueSize: "₹12,000 Cr",
+    windowDates: "15 Nov - 28 Nov 2024",
+    status: "Tender Open",
+    description: "Share buyback through tender offer route for retail and general shareholders.",
+  },
+  {
+    symbol: "INFY",
+    companyName: "Infosys Limited",
+    actionType: "BUYBACK",
+    tenderPrice: 1850.00,
+    currentMarketPrice: 1845.50,
+    premiumPercent: "+0.24%",
+    issueSize: "₹9,300 Cr",
+    windowDates: "01 Dec - 15 Dec 2024",
+    status: "Upcoming",
+    description: "Open market buyback program on recognized stock exchanges.",
+  },
+];
+
+app.get("/allCorporateActions", async (req, res) => {
+  res.status(200).json(curatedCorporateActions);
+});
+
+app.post("/tenderCorporateAction", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const { symbol, companyName, tenderedQty, tenderPrice } = req.body;
+    const numQty = Math.max(1, parseInt(tenderedQty) || 1);
+    const numPrice = parseFloat(tenderPrice) || 100;
+    const totalAmount = numQty * numPrice;
+
+    // Verify user owns sufficient shares in Demat holdings
+    const holding = await HoldingsModel.findOne({
+      userId,
+      $or: [{ name: symbol }, { instrument: symbol }],
+    });
+
+    const ownedQty = holding ? holding.qty : 0;
+    if (ownedQty < numQty) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient Demat shares! You hold ${ownedQty} shares of ${symbol}, but attempted to tender ${numQty} shares.`,
+      });
+    }
+
+    const tenderRef = `CORP-${new Date().getFullYear()}-${symbol}-${Math.floor(10000 + Math.random() * 90000)}`;
+
+    const newTender = new CorporateActionModel({
+      userId,
+      symbol,
+      companyName,
+      actionType: "BUYBACK",
+      tenderPrice: numPrice,
+      tenderedQty: numQty,
+      totalAmount,
+      status: "TENDERED",
+      tenderRef,
+    });
+    await newTender.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "COMPLIANCE",
+        category: "CORPORATE_ACTION",
+        title: `Buyback Tender Placed - ${symbol}`,
+        description: `Successfully tendered ${numQty} shares of ${companyName} @ ₹${numPrice} (Total: ₹${totalAmount.toLocaleString("en-IN")}). Ref: ${tenderRef}.`,
+        metadata: { symbol, actionUrl: "/bids" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `Successfully tendered ${numQty} shares of ${companyName} for buyback!`,
+      tender: newTender,
+    });
+  } catch (error) {
+    console.error("Error tendering corporate action:", error);
+    res.status(500).json({ success: false, message: "Failed to tender shares for corporate action." });
+  }
+});
+
+app.get("/myCorporateActionTenders", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) return res.status(200).json([]);
+    const tenders = await CorporateActionModel.find({ userId }).sort({ createdAt: -1 });
+    res.status(200).json(tenders);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch corporate action tenders" });
+  }
+});
+
+// ============================================================================
+// AUCTIONS (EXCHANGE SETTLEMENT AUCTIONS FOR SHORT DELIVERIES)
+// ============================================================================
+
+app.get("/allAuctions", async (req, res) => {
+  try {
+    let count = await AuctionModel.countDocuments();
+    if (count === 0) {
+      const defaultAuctions = [
+        {
+          symbol: "HDFCBANK",
+          name: "HDFC Bank Limited",
+          exchange: "NSE",
+          settlementType: "T+1 Short Delivery",
+          shortQtyRequired: 150,
+          basePrice: 1728.15,
+          maxAllowedPrice: 2073.78, // +20% upper cap
+          auctionWindow: "14:00 - 14:45 IST",
+          status: "OPEN",
+          settlementDate: "Tomorrow (T+1)",
+        },
+        {
+          symbol: "TATAMOTORS",
+          name: "Tata Motors Limited",
+          exchange: "NSE",
+          settlementType: "T+1 Short Delivery",
+          shortQtyRequired: 400,
+          basePrice: 884.20,
+          maxAllowedPrice: 1061.04,
+          auctionWindow: "14:00 - 14:45 IST",
+          status: "OPEN",
+          settlementDate: "Tomorrow (T+1)",
+        },
+        {
+          symbol: "ZOMATO",
+          name: "Zomato Limited",
+          exchange: "NSE",
+          settlementType: "T+1 Short Delivery",
+          shortQtyRequired: 1200,
+          basePrice: 262.40,
+          maxAllowedPrice: 314.88,
+          auctionWindow: "14:00 - 14:45 IST",
+          status: "OPEN",
+          settlementDate: "Tomorrow (T+1)",
+        },
+        {
+          symbol: "RELIANCE",
+          name: "Reliance Industries Limited",
+          exchange: "NSE",
+          settlementType: "T+1 Short Delivery",
+          shortQtyRequired: 80,
+          basePrice: 2710.40,
+          maxAllowedPrice: 3252.48,
+          auctionWindow: "14:00 - 14:45 IST",
+          status: "OPEN",
+          settlementDate: "Tomorrow (T+1)",
+        },
+      ];
+      await AuctionModel.insertMany(defaultAuctions);
+    }
+    const auctions = await AuctionModel.find();
+    res.status(200).json(auctions);
+  } catch (error) {
+    console.error("Error fetching auctions:", error);
+    res.status(500).json({ error: "Failed to fetch exchange auctions" });
+  }
+});
+
+app.post("/submitAuctionOffer", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+
+    const { symbol, companyName, quantity, offerPrice } = req.body;
+    const numQty = Math.max(1, parseInt(quantity) || 1);
+    const numPrice = parseFloat(offerPrice);
+
+    if (!numPrice || numPrice <= 0) {
+      return res.status(400).json({ success: false, message: "Please provide a valid offer price" });
+    }
+
+    // Verify auction exists and price within +20% circuit
+    const auction = await AuctionModel.findOne({ symbol });
+    if (!auction) {
+      return res.status(404).json({ success: false, message: `No active auction found for ${symbol}` });
+    }
+
+    if (numPrice > auction.maxAllowedPrice) {
+      return res.status(400).json({
+        success: false,
+        message: `Offer price ₹${numPrice} exceeds the maximum exchange cap of ₹${auction.maxAllowedPrice.toFixed(2)} (+20% upper penalty limit).`,
+      });
+    }
+
+    // Verify user owns sufficient shares in Demat holdings
+    const holding = await HoldingsModel.findOne({
+      userId,
+      $or: [{ name: symbol }, { instrument: symbol }],
+    });
+
+    const ownedQty = holding ? holding.qty : 0;
+    if (ownedQty < numQty) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient Demat shares! You hold ${ownedQty} shares of ${symbol}, but attempted to offer ${numQty} shares in the auction.`,
+      });
+    }
+
+    const totalAmount = numQty * numPrice;
+    const premiumVal = ((numPrice - auction.basePrice) / auction.basePrice) * 100;
+    const premiumPercent = `${premiumVal >= 0 ? "+" : ""}${premiumVal.toFixed(2)}%`;
+    const orderId = `AUC-${new Date().getFullYear()}-${symbol}-${Math.floor(10000 + Math.random() * 90000)}`;
+
+    const newOffer = new AuctionOfferModel({
+      userId,
+      symbol,
+      companyName: companyName || auction.name,
+      exchange: auction.exchange || "NSE",
+      quantity: numQty,
+      basePrice: auction.basePrice,
+      offerPrice: numPrice,
+      totalAmount,
+      premiumPercent,
+      status: "OFFERED",
+      orderId,
+      settlementDate: auction.settlementDate,
+    });
+    await newOffer.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "AUCTION",
+        title: `Auction Offer Submitted - ${symbol}`,
+        description: `Offered ${numQty} shares of ${companyName || auction.name} @ ₹${numPrice.toFixed(2)} (${premiumPercent} premium). Settlement credit: ₹${totalAmount.toLocaleString("en-IN")}. Ref: ${orderId}.`,
+        metadata: { symbol, actionUrl: "/bids" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `Auction offer placed for ${numQty} shares of ${companyName || auction.name} @ ₹${numPrice.toFixed(2)}!`,
+      offer: newOffer,
+    });
+  } catch (error) {
+    console.error("Error submitting auction offer:", error);
+    res.status(500).json({ success: false, message: "Failed to place auction sell offer." });
+  }
+});
+
+app.get("/myAuctionOffers", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) return res.status(200).json([]);
+    const offers = await AuctionOfferModel.find({ userId }).sort({ createdAt: -1 });
+    res.status(200).json(offers);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch auction offers" });
+  }
+});
+
+// ============================================================================
+// SOCIAL STOCK EXCHANGE (SSE IPO - ZERO COUPON ZERO PRINCIPAL / ZCZP)
+// ============================================================================
+
+app.get("/allSseIpos", async (req, res) => {
+  try {
+    let count = await SseIpoModel.countDocuments();
+    if (count === 0) {
+      const defaultSse = [
+        {
+          symbol: "UNNATI",
+          orgName: "SGBS Unnati Foundation",
+          focusArea: "Youth Vocational Training & Employment",
+          issueDates: "04 Nov - 15 Nov 2024",
+          targetAmount: "₹2.00 Cr",
+          unitPrice: 100,
+          minUnits: 100,
+          minInvestment: 10000,
+          taxExemption: "100% Tax Exempt u/s 80G",
+          impactGoal: "Provide skill training and secure formal sector job placements for 10,000 underprivileged rural youth across 8 states",
+          socialAuditor: "KPMG Social Audit Services",
+          sebiRegNo: "SSE-NPO-2024-0019",
+          status: "Apply",
+          rhpUrl: "https://www.bseindia.com/markets/social-stock-exchange",
+        },
+        {
+          symbol: "GOONJ",
+          orgName: "Goonj Welfare Foundation",
+          focusArea: "Rural Livelihood & Flood Relief Infrastructure",
+          issueDates: "08 Nov - 20 Nov 2024",
+          targetAmount: "₹3.50 Cr",
+          unitPrice: 100,
+          minUnits: 100,
+          minInvestment: 10000,
+          taxExemption: "100% Tax Exempt u/s 80G",
+          impactGoal: "Reconstruct 45 flood-resilient community bridges, water wells, and livelihood centers in flood-prone districts of Assam and Bihar",
+          socialAuditor: "PwC India Social Audit",
+          sebiRegNo: "SSE-NPO-2024-0024",
+          status: "Apply",
+          rhpUrl: "https://www.bseindia.com/markets/social-stock-exchange",
+        },
+        {
+          symbol: "PRATHAM",
+          orgName: "Pratham Education Foundation",
+          focusArea: "Primary Child Literacy & Digital Learning",
+          issueDates: "12 Nov - 25 Nov 2024",
+          targetAmount: "₹5.00 Cr",
+          unitPrice: 100,
+          minUnits: 100,
+          minInvestment: 10000,
+          taxExemption: "100% Tax Exempt u/s 80G",
+          impactGoal: "Deliver foundational literacy and interactive tablet-based numeracy kits to 50,000 primary school children in rural government schools",
+          socialAuditor: "Deloitte Social Advisory",
+          sebiRegNo: "SSE-NPO-2024-0031",
+          status: "Apply",
+          rhpUrl: "https://www.bseindia.com/markets/social-stock-exchange",
+        },
+        {
+          symbol: "DEEPAKFDN",
+          orgName: "Deepak Foundation",
+          focusArea: "Maternal Health & Mobile Tribal Clinics",
+          issueDates: "18 Nov - 30 Nov 2024",
+          targetAmount: "₹1.75 Cr",
+          unitPrice: 100,
+          minUnits: 100,
+          minInvestment: 10000,
+          taxExemption: "100% Tax Exempt u/s 80G",
+          impactGoal: "Operate 12 specialized mobile medical care units serving 75,000 expectant mothers and infants in remote tribal areas",
+          socialAuditor: "EY India Social Assurance",
+          sebiRegNo: "SSE-NPO-2024-0042",
+          status: "Apply",
+          rhpUrl: "https://www.bseindia.com/markets/social-stock-exchange",
+        },
+      ];
+      await SseIpoModel.insertMany(defaultSse);
+    }
+    const sseIpos = await SseIpoModel.find();
+    res.status(200).json(sseIpos);
+  } catch (error) {
+    console.error("Error fetching SSE IPOs:", error);
+    res.status(500).json({ error: "Failed to fetch Social Stock Exchange IPOs" });
+  }
+});
+
+app.post("/applySseIpo", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+
+    const { symbol, orgName, units, panNumber, upiId, taxReceiptRequested } = req.body;
+    const numUnits = Math.max(100, parseInt(units) || 100);
+    const unitPrice = 100;
+    const totalAmount = numUnits * unitPrice;
+
+    if (!panNumber || panNumber.trim().length < 10) {
+      return res.status(400).json({ success: false, message: "Valid 10-character PAN is required for Section 80G compliance" });
+    }
+
+    if (!upiId || !upiId.includes("@")) {
+      return res.status(400).json({ success: false, message: "Valid UPI Virtual Payment Address (VPA) is required for ASBA lien" });
+    }
+
+    const taxCertificateNo = `80G-SSE-${symbol}-${Date.now().toString().slice(-6)}`;
+    const asbaReference = `ASBA-SSE-${Math.floor(100000 + Math.random() * 900000)}`;
+
+    const newApp = new SseApplicationModel({
+      userId,
+      symbol,
+      orgName,
+      units: numUnits,
+      unitPrice,
+      totalAmount,
+      panNumber: panNumber.trim().toUpperCase(),
+      taxReceiptRequested: taxReceiptRequested !== false,
+      taxCertificateNo,
+      upiId: upiId.trim(),
+      status: "APPLIED",
+      mandateStatus: "ACCEPTED",
+      asbaReference,
+    });
+    await newApp.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "COMPLIANCE",
+        category: "SSE_IPO",
+        title: `SSE Contribution Placed - ${orgName}`,
+        description: `Subscribed to ${numUnits} ZCZP units of ${orgName} (Total: ₹${totalAmount.toLocaleString("en-IN")}). 80G Certificate: ${taxCertificateNo}. ASBA Ref: ${asbaReference}.`,
+        metadata: { symbol, actionUrl: "/bids" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `Successfully contributed ₹${totalAmount.toLocaleString("en-IN")} (${numUnits} units) to ${orgName}!`,
+      application: newApp,
+    });
+  } catch (error) {
+    console.error("Error applying to SSE IPO:", error);
+    res.status(500).json({ success: false, message: "Failed to place Social Stock Exchange contribution." });
+  }
+});
+
+app.get("/mySseApplications", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) return res.status(200).json([]);
+    const apps = await SseApplicationModel.find({ userId }).sort({ createdAt: -1 });
+    res.status(200).json(apps);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch SSE applications" });
+  }
+});
+
+
+
+// ============================================================================
+// STOCK SIP (SYSTEMATIC INVESTMENT PLAN) ENGINE
+// ============================================================================
+
+// Helper: Calculate Next Trigger Date based on frequency, day, and time
+function calculateNextTriggerDate(frequency, scheduleDay, scheduleTime) {
+  const [hours, minutes] = (scheduleTime || "09:30").split(":").map(Number);
+  const now = new Date();
+  let next = new Date();
+  next.setHours(hours, minutes, 0, 0);
+
+  if (frequency === "WEEKLY") {
+    const targetDay = Math.min(Math.max(1, scheduleDay || 1), 5); // 1=Mon...5=Fri
+    const currentDay = now.getDay();
+    let daysUntil = targetDay - currentDay;
+    if (daysUntil < 0 || (daysUntil === 0 && now >= next)) {
+      daysUntil += 7;
+    }
+    next.setDate(now.getDate() + daysUntil);
+  } else if (frequency === "DAILY") {
+    if (now >= next) {
+      next.setDate(now.getDate() + 1);
+    }
+    if (next.getDay() === 6) next.setDate(next.getDate() + 2);
+    if (next.getDay() === 0) next.setDate(next.getDate() + 1);
+  } else {
+    // MONTHLY
+    const targetDay = Math.min(Math.max(1, scheduleDay || 5), 28);
+    next.setDate(targetDay);
+    if (now >= next) {
+      next.setMonth(next.getMonth() + 1);
+      next.setDate(targetDay);
+    }
+  }
+  return next;
+}
+
+// Helper: Advance to the Next Execution Cycle (used when an installment is executed)
+function advanceNextTriggerDate(frequency, scheduleDay, scheduleTime, currentTrigger) {
+  const [hours, minutes] = (scheduleTime || "09:30").split(":").map(Number);
+  const now = new Date();
+  let base = currentTrigger ? new Date(currentTrigger) : new Date();
+
+  // If the previous trigger was in the past or today, ensure forward advancement
+  if (base <= now) {
+    base = new Date(now);
+  }
+
+  let next = new Date(base);
+  next.setHours(hours, minutes, 0, 0);
+
+  if (frequency === "WEEKLY") {
+    next.setDate(next.getDate() + 7);
+  } else if (frequency === "DAILY") {
+    next.setDate(next.getDate() + 1);
+    if (next.getDay() === 6) next.setDate(next.getDate() + 2); // Saturday -> Monday
+    if (next.getDay() === 0) next.setDate(next.getDate() + 1); // Sunday -> Monday
+  } else {
+    // MONTHLY
+    const targetDay = Math.min(Math.max(1, scheduleDay || 5), 28);
+    next.setMonth(next.getMonth() + 1);
+    next.setDate(targetDay);
+  }
+  return next;
+}
+
+// 0. Catalog of 50 Real Market SIPs (Stored in & Fetched directly from MongoDB Atlas!)
+app.get("/marketSipsCatalog", async (req, res) => {
+  try {
+    let catalog = await MarketSipCatalogModel.find({}).sort({ code: 1 }).lean();
+    if (!catalog || catalog.length === 0) {
+      catalog = marketSips50;
+    }
+    return res.status(200).json(catalog);
+  } catch (err) {
+    console.error("Error fetching market SIP catalog from DB:", err.message);
+    return res.status(200).json(marketSips50);
+  }
+});
+
+// 1. Fetch all user SIPs (with default seeding from real market catalog if empty)
+app.get("/allSips", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(200).json([]);
+    }
+    let sips = await SipModel.find({ userId }).sort({ createdAt: -1 });
+
+    if (sips.length === 0) {
+      // Seed with top real market SIPs (e.g. Nifty BeES and Reliance)
+      const relianceMarket = marketSips50.find((m) => m.code === "SIP_RELIANCE");
+      const niftyBeesMarket = marketSips50.find((m) => m.code === "SIP_NIFTYBEES");
+
+      const seedSips = [];
+      if (relianceMarket) {
+        seedSips.push({
+          userId,
+          name: relianceMarket.name,
+          sipType: "STOCK",
+          symbol: "RELIANCE",
+          instruments: relianceMarket.instruments,
+          minAmount: relianceMarket.minAmount,
+          frequency: "MONTHLY",
+          scheduleDay: 5,
+          scheduleTime: "09:30",
+          status: "ACTIVE",
+          nextTriggerAt: calculateNextTriggerDate("MONTHLY", 5, "09:30"),
+          totalInstallmentsExecuted: 0,
+          totalCapitalInvested: 0,
+          executionLogs: [],
+        });
+      }
+      if (niftyBeesMarket) {
+        seedSips.push({
+          userId,
+          name: niftyBeesMarket.name,
+          sipType: "ETF",
+          symbol: "NIFTYBEES",
+          instruments: niftyBeesMarket.instruments,
+          minAmount: niftyBeesMarket.minAmount,
+          frequency: "WEEKLY",
+          scheduleDay: 1, // Monday
+          scheduleTime: "09:30",
+          status: "ACTIVE",
+          nextTriggerAt: calculateNextTriggerDate("WEEKLY", 1, "09:30"),
+          totalInstallmentsExecuted: 0,
+          totalCapitalInvested: 0,
+          executionLogs: [],
+        });
+      }
+
+      if (seedSips.length > 0) {
+        sips = await SipModel.insertMany(seedSips);
+      }
+    }
+
+    res.status(200).json(sips);
+  } catch (error) {
+    console.error("Error fetching SIPs:", error);
+    res.status(500).json({ error: "Failed to fetch SIPs" });
+  }
+});
+
+// 2. Create New Stock SIP (Supports 50 Real Market SIPs directly without a basket!)
+app.post("/createSip", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "userId is required to create SIP" });
+    }
+    const {
+      name,
+      sipType = "STOCK",
+      marketSipCode,
+      basketId,
+      instruments: customInstruments,
+      frequency = "MONTHLY",
+      scheduleDay = 5,
+      scheduleTime = "09:30",
+    } = req.body;
+
+    let finalName = name;
+    let finalInstruments = [];
+    let finalBasketId = basketId || null;
+    let finalBasketName = null;
+    let finalSymbol = null;
+    let finalMinAmount = 0;
+    let finalSipType = sipType;
+
+    // Mode A: Direct from 50 Real Market SIPs (Zero Basket dependency!)
+    if (marketSipCode) {
+      let marketPlan = await MarketSipCatalogModel.findOne({ code: marketSipCode }).lean();
+      if (!marketPlan) {
+        marketPlan = marketSips50.find((m) => m.code === marketSipCode);
+      }
+      if (!marketPlan) {
+        return res.status(404).json({ success: false, message: "Market SIP plan not found." });
+      }
+      finalName = finalName || marketPlan.name;
+      finalInstruments = marketPlan.instruments;
+      finalSymbol = marketPlan.symbol;
+      finalMinAmount = marketPlan.minAmount;
+      finalSipType = marketPlan.category.includes("ETF")
+        ? "ETF"
+        : marketPlan.category.includes("Thematic")
+        ? "THEMATIC"
+        : "STOCK";
+    }
+    // Mode B: Direct custom instruments
+    else if (Array.isArray(customInstruments) && customInstruments.length > 0) {
+      finalInstruments = customInstruments;
+      finalSymbol = customInstruments[0].symbol;
+      finalMinAmount = customInstruments.reduce(
+        (acc, i) => acc + (i.price || 100) * (i.qty || 1),
+        0
+      );
+    }
+    // Mode C: Legacy user basket
+    else if (basketId) {
+      const basket = await BasketModel.findById(basketId);
+      if (!basket) {
+        return res.status(404).json({ success: false, message: "Selected basket does not exist." });
+      }
+      finalBasketId = basket._id;
+      finalBasketName = basket.name;
+      finalInstruments = basket.items;
+      finalName = finalName || `${basket.name} SIP`;
+      finalMinAmount = basket.marginRequired;
+      finalSipType = "BASKET";
+    } else {
+      return res.status(400).json({
+        success: false,
+        message: "Please choose a market SIP or stock to start your SIP.",
+      });
+    }
+
+    if (!finalName || !finalName.trim()) {
+      return res.status(400).json({ success: false, message: "SIP name is required." });
+    }
+
+    const nextTriggerAt = calculateNextTriggerDate(frequency, Number(scheduleDay), scheduleTime);
+
+    const newSip = new SipModel({
+      userId,
+      name: finalName.trim(),
+      sipType: finalSipType,
+      symbol: finalSymbol,
+      basketId: finalBasketId,
+      basketName: finalBasketName,
+      instruments: finalInstruments,
+      minAmount: finalMinAmount,
+      frequency,
+      scheduleDay: Number(scheduleDay),
+      scheduleTime,
+      status: "ACTIVE",
+      nextTriggerAt,
+      totalInstallmentsExecuted: 0,
+      totalCapitalInvested: 0,
+      executionLogs: [],
+    });
+
+    const savedSip = await newSip.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "EXECUTION",
+        title: `Stock SIP Started - ${finalName}`,
+        description: `Scheduled ${frequency.toLowerCase()} SIP on ${finalSymbol || finalName}. Next installment: ${nextTriggerAt.toLocaleDateString("en-IN")}.`,
+        metadata: { actionUrl: "/orders" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `Stock SIP "${finalName}" started successfully!`,
+      sip: savedSip,
+    });
+  } catch (error) {
+    console.error("Error creating SIP:", error);
+    res.status(500).json({ success: false, message: "Failed to create Stock SIP" });
+  }
+});
+
+// 3. Toggle Status (Active / Paused)
+app.patch("/toggleSipStatus/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const sip = await SipModel.findById(id);
+    if (!sip) return res.status(404).json({ success: false, message: "SIP not found" });
+
+    sip.status = sip.status === "ACTIVE" ? "PAUSED" : "ACTIVE";
+    if (sip.status === "ACTIVE") {
+      sip.nextTriggerAt = calculateNextTriggerDate(sip.frequency, sip.scheduleDay, sip.scheduleTime);
+    }
+    await sip.save();
+
+    try {
+      await createNotification({
+        userId: sip.userId,
+        type: "ORDER",
+        category: "EXECUTION",
+        title: `SIP ${sip.status === "ACTIVE" ? "Resumed" : "Paused"} - ${sip.name}`,
+        description: `Stock SIP "${sip.name}" is now ${sip.status.toLowerCase()}.`,
+        metadata: { actionUrl: "/orders" },
+      });
+    } catch (e) {}
+
+    res.status(200).json({ success: true, message: `SIP "${sip.name}" is now ${sip.status}.`, sip });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to toggle SIP status" });
+  }
+});
+
+// 3b. Rename SIP Endpoint
+app.patch("/updateSipName/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, message: "Valid SIP name is required." });
+    }
+    const sip = await SipModel.findById(id);
+    if (!sip) return res.status(404).json({ success: false, message: "SIP not found." });
+
+    const oldName = sip.name;
+    sip.name = name.trim();
+    await sip.save();
+
+    try {
+      await createNotification({
+        userId: sip.userId,
+        type: "ORDER",
+        category: "EXECUTION",
+        title: `SIP Renamed - ${sip.name}`,
+        description: `Stock SIP "${oldName}" was renamed to "${sip.name}".`,
+        metadata: { actionUrl: "/orders" },
+      });
+    } catch (e) {}
+
+    return res.status(200).json({ success: true, message: `SIP renamed to "${sip.name}".`, sip });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: "Failed to rename SIP." });
+  }
+});
+
+// 4. Internal Executor function (Supports direct instruments or linked baskets!)
+async function executeSipInternal(sipId) {
+  const sip = await SipModel.findById(sipId);
+  if (!sip) throw new Error("SIP not found");
+
+  // Resolve order legs: direct instruments preferred, fallback to basket
+  let orderLegs = Array.isArray(sip.instruments) && sip.instruments.length > 0 ? sip.instruments : [];
+  if (orderLegs.length === 0 && sip.basketId) {
+    const basket = await BasketModel.findById(sip.basketId);
+    if (basket && Array.isArray(basket.items)) {
+      orderLegs = basket.items;
+    }
+  }
+
+  if (orderLegs.length === 0) {
+    throw new Error(`SIP "${sip.name}" has no investment instruments configured`);
+  }
+
+  const userId = sip.userId;
+
+  // Check user email
+  let userEmail = process.env.EMAIL_USER;
+  const userDoc = await UserModel.findOne({ userId });
+  if (userDoc?.email) userEmail = userDoc.email;
+
+  // Calculate required margin
+  let totalMarginRequired = 0;
+  for (const item of orderLegs) {
+    const cost = (Number(item.qty) || 1) * (Number(item.price) || 100);
+    totalMarginRequired += item.product === "MIS" ? cost * 0.2 : cost;
+  }
+
+  let funds = await getOrCreateUserFunds(userId);
+  const availableMargin = parseFloat(funds?.equity?.availableMargin?.replace(/,/g, "") || "0");
+
+  const nextCycleDate = advanceNextTriggerDate(sip.frequency, sip.scheduleDay, sip.scheduleTime, sip.nextTriggerAt);
+  const formattedNextDate = nextCycleDate.toLocaleDateString("en-IN", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+
+  // 1. INSUFFICIENT MARGIN CASE (Option A + Email Alert)
+  if (availableMargin < totalMarginRequired) {
+    sip.executionLogs.push({
+      executedAt: new Date(),
+      ordersCount: 0,
+      amountDebited: 0,
+      status: "FAILED_INSUFFICIENT_FUNDS",
+      failureReason: `Required: ₹${totalMarginRequired.toLocaleString("en-IN")}, Available: ₹${availableMargin.toLocaleString("en-IN")}`,
+    });
+    sip.nextTriggerAt = nextCycleDate;
+    await sip.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "FUNDS",
+        category: "MARGIN",
+        title: `SIP Skipped - ${sip.name}`,
+        description: `Installment skipped due to insufficient margin. Required: ₹${formatIndianCurrency(totalMarginRequired)}, Available: ₹${formatIndianCurrency(availableMargin)}.`,
+        metadata: { actionUrl: "/funds" },
+      });
+    } catch (e) {}
+
+    await sendSipFailureEmail({
+      toEmail: userEmail,
+      sipName: sip.name,
+      basketName: sip.basketName || sip.symbol || sip.name,
+      requiredAmount: totalMarginRequired,
+      availableAmount: availableMargin,
+      nextDate: formattedNextDate,
+    });
+
+    return {
+      success: false,
+      code: "INSUFFICIENT_MARGIN",
+      message: `Insufficient margin! Required: ₹${formatIndianCurrency(totalMarginRequired)}, Available: ₹${formatIndianCurrency(availableMargin)}. Failure alert sent to ${userEmail}.`,
+      sip,
+    };
+  }
+
+  // 2. SUFFICIENT MARGIN: Execute order legs concurrently
+  const executedOrders = [];
+  let totalDebited = 0;
+
+  for (const item of orderLegs) {
+    const result = await executeOrderInternal({
+      name: item.symbol || item.name,
+      qty: item.qty || 1,
+      price: item.price,
+      mode: item.mode || "BUY",
+      product: item.product || "CNC",
+      userId,
+    });
+
+    if (!result.success) {
+      throw new Error(`Failed to execute leg ${item.symbol}: ${result.message}`);
+    }
+    executedOrders.push(result.order);
+    totalDebited += (Number(item.qty) || 1) * (Number(item.price) || 100);
+  }
+
+  sip.totalInstallmentsExecuted += 1;
+  sip.totalCapitalInvested += totalDebited;
+  sip.lastExecutedAt = new Date();
+  sip.nextTriggerAt = nextCycleDate;
+  sip.executionLogs.push({
+    executedAt: new Date(),
+    ordersCount: executedOrders.length,
+    amountDebited: totalDebited,
+    status: "SUCCESS",
+  });
+  await sip.save();
+
+  try {
+    await createNotification({
+      userId,
+      type: "ORDER",
+      category: "EXECUTION",
+      title: `Stock SIP Executed - ${sip.name}`,
+      description: `SIP installment executed with ${executedOrders.length} orders totaling ₹${formatIndianCurrency(totalDebited)}.`,
+      metadata: { actionUrl: "/orders" },
+    });
+  } catch (e) {}
+
+  await sendSipSuccessEmail({
+    toEmail: userEmail,
+    sipName: sip.name,
+    basketName: sip.basketName || sip.symbol || sip.name,
+    executedOrdersCount: executedOrders.length,
+    totalAmount: totalDebited,
+    nextDate: formattedNextDate,
+  });
+
+  return {
+    success: true,
+    message: `Stock SIP "${sip.name}" executed successfully! ${executedOrders.length} orders placed.`,
+    sip,
+    executedOrders,
+  };
+}
+
+// 5. Route to trigger SIP immediately (Option 1 - Interactive Pro Mode)
+app.post("/executeSipNow/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await executeSipInternal(id);
+    if (!result.success) {
+      return res.status(400).json(result);
+    }
+    return res.status(200).json(result);
+  } catch (error) {
+    console.error("Error executing SIP:", error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to execute SIP" });
+  }
+});
+
+// 6. Delete SIP
+app.delete("/deleteSip/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = await SipModel.findByIdAndDelete(id);
+    if (deleted) {
+      try {
+        await createNotification({
+          userId: deleted.userId,
+          type: "ORDER",
+          category: "EXECUTION",
+          title: `SIP Deleted - ${deleted.name}`,
+          description: `Stock SIP "${deleted.name}" has been permanently cancelled.`,
+          metadata: { actionUrl: "/orders" },
+        });
+      } catch (e) {}
+    }
+    res.status(200).json({ success: true, message: "SIP deleted successfully" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to delete SIP" });
+  }
+});
+
+// 7. Background Heartbeat Worker for SIPs (Runs every 45s)
+setInterval(async () => {
+  try {
+    const now = new Date();
+    const dueSips = await SipModel.find({
+      status: "ACTIVE",
+      nextTriggerAt: { $lte: now },
+    });
+
+    for (const sip of dueSips) {
+      console.log(`⏰ [SIP CRON TRIGGERED] Executing due SIP: "${sip.name}" (ID: ${sip._id})`);
+      try {
+        await executeSipInternal(sip._id);
+      } catch (err) {
+        console.error(`Error in automated SIP execution for ${sip.name}:`, err.message);
+      }
+    }
+  } catch (e) {}
+}, 45000);
+
+
+// ============================================================================
+// REAL-TIME PRICE ALERTS (SENTINEL ENGINE) ROUTES & EVALUATION WORKER
+// ============================================================================
+
+// 1. Fetch user alerts with dynamic live LTP & proximity calculations
+app.get("/alerts", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const statusFilter = req.query.status; // "ALL", "ACTIVE", "TRIGGERED", "DISABLED"
+
+    const query = { userId };
+    if (statusFilter && statusFilter !== "ALL") {
+      query.status = statusFilter.toUpperCase();
+    }
+
+    const alerts = await AlertModel.find(query).sort({ createdAt: -1 }).lean();
+
+    // Attach latest live LTP from instruments collection
+    const allInstruments = await InstrumentModel.find({}).lean();
+    const priceMap = new Map();
+    allInstruments.forEach((i) => {
+      if (i.name) priceMap.set(i.name.toUpperCase(), i.price || i.ltp || 100);
+      if (i.symbol) priceMap.set(i.symbol.toUpperCase(), i.price || i.ltp || 100);
+    });
+
+    const enrichedAlerts = alerts.map((a) => {
+      const sym = a.symbol?.toUpperCase();
+      const currentLtp = priceMap.get(sym) || a.initialLtp || a.targetPrice;
+
+      // Calculate distance to target
+      let distancePct = 0;
+      let distanceValue = 0;
+      if (a.conditionType === "GTE") {
+        distanceValue = a.targetPrice - currentLtp;
+        distancePct = currentLtp > 0 ? ((a.targetPrice - currentLtp) / currentLtp) * 100 : 0;
+      } else if (a.conditionType === "LTE") {
+        distanceValue = currentLtp - a.targetPrice;
+        distancePct = currentLtp > 0 ? ((currentLtp - a.targetPrice) / currentLtp) * 100 : 0;
+      } else if (a.conditionType === "PCT_UP" || a.conditionType === "PCT_DOWN") {
+        distancePct = a.targetPercentage;
+      }
+
+      return {
+        ...a,
+        currentLtp,
+        distancePct: Number(distancePct.toFixed(2)),
+        distanceValue: Number(distanceValue.toFixed(2)),
+      };
+    });
+
+    res.status(200).json(enrichedAlerts);
+  } catch (error) {
+    console.error("Error fetching alerts:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch alerts" });
+  }
+});
+
+// 2. Create Price Alert
+app.post("/createAlert", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(400).json({ success: false, message: "userId is required to create alert" });
+    }
+    const {
+      symbol,
+      name,
+      conditionType = "GTE",
+      targetPrice,
+      targetPercentage,
+      notes,
+    } = req.body;
+
+    if (!symbol) {
+      return res.status(400).json({ success: false, message: "Symbol is required" });
+    }
+
+    // Get current LTP for symbol
+    const cleanSym = symbol.toUpperCase().trim();
+    const inst = await InstrumentModel.findOne({ name: cleanSym });
+    const currentPrice = inst ? (inst.price || inst.ltp) : 1000;
+    const stockName = inst ? (inst.instrument || inst.name) : (name || cleanSym);
+
+    const newAlert = new AlertModel({
+      userId,
+      symbol: cleanSym,
+      name: stockName,
+      conditionType,
+      targetPrice: Number(targetPrice) || currentPrice,
+      targetPercentage: Number(targetPercentage) || 0,
+      initialLtp: currentPrice,
+      notes: notes || "",
+      status: "ACTIVE",
+    });
+
+    const savedAlert = await newAlert.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "EXECUTION",
+        title: `Alert Set - ${cleanSym}`,
+        description: `Price alert activated: ${conditionType === "GTE" ? "≥" : "≤"} ₹${Number(targetPrice).toLocaleString("en-IN")}.`,
+        metadata: { actionUrl: "/orders" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({ success: true, alert: savedAlert });
+  } catch (error) {
+    console.error("Error creating alert:", error);
+    res.status(500).json({ success: false, message: "Failed to create alert" });
+  }
+});
+
+// 3. Update Price Alert
+app.put("/updateAlert/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { conditionType, targetPrice, targetPercentage, notes } = req.body;
+
+    const alert = await AlertModel.findById(id);
+    if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
+
+    if (conditionType) alert.conditionType = conditionType;
+    if (targetPrice !== undefined) alert.targetPrice = Number(targetPrice);
+    if (targetPercentage !== undefined) alert.targetPercentage = Number(targetPercentage);
+    if (notes !== undefined) alert.notes = notes;
+
+    await alert.save();
+    res.status(200).json({ success: true, alert });
+  } catch (error) {
+    console.error("Error updating alert:", error);
+    res.status(500).json({ success: false, message: "Failed to update alert" });
+  }
+});
+
+// 4. Toggle Status (Active <-> Disabled)
+app.patch("/toggleAlertStatus/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const alert = await AlertModel.findById(id);
+    if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
+
+    alert.status = alert.status === "ACTIVE" ? "DISABLED" : "ACTIVE";
+    await alert.save();
+
+    res.status(200).json({ success: true, alert });
+  } catch (error) {
+    console.error("Error toggling alert status:", error);
+    res.status(500).json({ success: false, message: "Failed to toggle alert status" });
+  }
+});
+
+// 5. Reset Triggered Alert back to Active
+app.post("/resetAlert/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const alert = await AlertModel.findById(id);
+    if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
+
+    alert.status = "ACTIVE";
+    alert.triggeredAt = undefined;
+    alert.triggeredPrice = undefined;
+    await alert.save();
+
+    res.status(200).json({ success: true, message: `Alert for ${alert.symbol} re-armed!`, alert });
+  } catch (error) {
+    console.error("Error resetting alert:", error);
+    res.status(500).json({ success: false, message: "Failed to reset alert" });
+  }
+});
+
+// 6. Delete Alert
+app.delete("/deleteAlert/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = await AlertModel.findByIdAndDelete(id);
+    if (deleted) {
+      try {
+        await createNotification({
+          userId: deleted.userId,
+          type: "ORDER",
+          category: "EXECUTION",
+          title: `Alert Deleted - ${deleted.symbol}`,
+          description: `Price alert for ${deleted.symbol} was removed.`,
+          metadata: { actionUrl: "/orders" },
+        });
+      } catch (e) {}
+    }
+    res.status(200).json({ success: true, message: "Alert deleted successfully" });
+  } catch (error) {
+    console.error("Error deleting alert:", error);
+    res.status(500).json({ success: false, message: "Failed to delete alert" });
+  }
+});
+
+// 7. Background Sentinel Price Alert Evaluation Engine (Runs every 15s)
+async function evaluatePriceAlerts() {
+  try {
+    const activeAlerts = await AlertModel.find({ status: "ACTIVE" });
+    if (activeAlerts.length === 0) return;
+
+    const allInstruments = await InstrumentModel.find({}).lean();
+    const priceMap = new Map();
+    allInstruments.forEach((i) => {
+      if (i.name) priceMap.set(i.name.toUpperCase(), i.price || i.ltp || 100);
+      if (i.symbol) priceMap.set(i.symbol.toUpperCase(), i.price || i.ltp || 100);
+    });
+
+    for (const alert of activeAlerts) {
+      const sym = alert.symbol?.toUpperCase();
+      const currentPrice = priceMap.get(sym);
+      if (!currentPrice) continue;
+
+      let triggered = false;
+      let conditionText = "";
+
+      if (alert.conditionType === "GTE" && currentPrice >= alert.targetPrice) {
+        triggered = true;
+        conditionText = `LTP crossed above or reached ₹${Number(alert.targetPrice).toLocaleString("en-IN")}`;
+      } else if (alert.conditionType === "LTE" && currentPrice <= alert.targetPrice) {
+        triggered = true;
+        conditionText = `LTP dropped below or reached ₹${Number(alert.targetPrice).toLocaleString("en-IN")}`;
+      } else if (alert.conditionType === "PCT_UP") {
+        const changePct = alert.initialLtp > 0 ? ((currentPrice - alert.initialLtp) / alert.initialLtp) * 100 : 0;
+        if (changePct >= alert.targetPercentage) {
+          triggered = true;
+          conditionText = `Day change gained +${alert.targetPercentage}% (current: +${changePct.toFixed(2)}%)`;
+        }
+      } else if (alert.conditionType === "PCT_DOWN") {
+        const changePct = alert.initialLtp > 0 ? ((currentPrice - alert.initialLtp) / alert.initialLtp) * 100 : 0;
+        if (changePct <= -alert.targetPercentage) {
+          triggered = true;
+          conditionText = `Day change dipped -${alert.targetPercentage}% (current: ${changePct.toFixed(2)}%)`;
+        }
+      }
+
+      if (triggered) {
+        console.log(`🚨 [ALERT TRIGGERED] ${alert.symbol}: ${conditionText} (LTP: ₹${currentPrice})`);
+        alert.status = "TRIGGERED";
+        alert.triggeredAt = new Date();
+        alert.triggeredPrice = currentPrice;
+        await alert.save();
+
+        const user = await UserModel.findOne({ userId: alert.userId });
+        const userEmail = user?.email;
+        if (!userEmail) continue;
+
+        // Dispatch In-App Notification
+        try {
+          await createNotification({
+            userId: alert.userId,
+            type: "ORDER",
+            category: "EXECUTION",
+            title: `🚨 Alert Triggered: ${alert.symbol} @ ₹${currentPrice.toLocaleString("en-IN")}`,
+            description: `${alert.symbol} ${conditionText}. ${alert.notes ? `Note: "${alert.notes}"` : ""}`,
+            metadata: { actionUrl: "/orders", symbol: alert.symbol },
+          });
+        } catch (e) {}
+
+        // Dispatch Nodemailer Email Alert
+        await sendAlertTriggeredEmail({
+          toEmail: userEmail,
+          symbol: alert.symbol,
+          name: alert.name,
+          conditionText,
+          targetValue: alert.targetPrice || alert.targetPercentage,
+          triggeredPrice: currentPrice,
+          notes: alert.notes,
+        });
+      }
+    }
+  } catch (err) {
+    console.error("Error evaluating price alerts:", err.message);
+  }
+}
+
+setInterval(evaluatePriceAlerts, 15000);
+
+
+
+// ============================================================================
+// 8. SEGMENT SETTINGS & KILL SWITCH SUBSYSTEM (SEBI / ZERODHA RISK CONTROLS)
+// ============================================================================
+
+app.get("/userSegments", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+    let user = await UserModel.findOne({ userId });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    if (!user.segments || !user.segments.equity) {
+      user.segments = {
+        equity: {
+          name: "NSE & BSE Equity (Cash)",
+          exchange: "NSE, BSE",
+          active: true,
+          deactivatedAt: null,
+          activatedAt: new Date(),
+        },
+        futuresAndOptions: {
+          name: "Futures & Options (F&O)",
+          exchange: "NFO, BFO",
+          active: true,
+          deactivatedAt: null,
+          activatedAt: new Date(),
+        },
+        currency: {
+          name: "Currency Derivatives (CDS)",
+          exchange: "CDS, BCD",
+          active: false,
+          deactivatedAt: null,
+          activatedAt: null,
+        },
+        commodity: {
+          name: "Commodity Derivatives",
+          exchange: "MCX",
+          active: false,
+          deactivatedAt: null,
+          activatedAt: null,
+        },
+      };
+      user.markModified("segments");
+      await user.save();
+    }
+
+    const now = Date.now();
+    const twelveHoursMs = 12 * 60 * 60 * 1000;
+    const enrichedSegments = {};
+
+    for (const [key, seg] of Object.entries(user.segments)) {
+      let cooldownRemainingMs = 0;
+      let canReactivate = true;
+      if (!seg.active && seg.deactivatedAt) {
+        const elapsed = now - new Date(seg.deactivatedAt).getTime();
+        if (elapsed < twelveHoursMs) {
+          cooldownRemainingMs = twelveHoursMs - elapsed;
+          canReactivate = false;
+        }
+      }
+      enrichedSegments[key] = {
+        ...seg,
+        cooldownRemainingMs,
+        canReactivate,
+      };
+    }
+
+    res.status(200).json({
+      success: true,
+      segments: enrichedSegments,
+      userDemat: user.demat,
+      annualIncome: user.annualIncome,
+    });
+  } catch (err) {
+    console.error("Error fetching user segments:", err);
+    res.status(500).json({ success: false, message: "Failed to fetch segments" });
+  }
+});
+
+app.post("/updateSegments", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+    const { segmentKey, targetState, annualIncome } = req.body;
+    if (!segmentKey || typeof targetState !== "boolean") {
+      return res.status(400).json({ success: false, message: "Valid segmentKey and boolean targetState required." });
+    }
+
+    const user = await UserModel.findOne({ userId });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    if (!user.segments) user.segments = {};
+
+    const defaultNames = {
+      equity: { name: "NSE & BSE Equity (Cash)", exchange: "NSE, BSE" },
+      futuresAndOptions: { name: "Futures & Options (F&O)", exchange: "NFO, BFO" },
+      currency: { name: "Currency Derivatives (CDS)", exchange: "CDS, BCD" },
+      commodity: { name: "Commodity Derivatives", exchange: "MCX" },
+    };
+
+    const currentSeg = user.segments[segmentKey] || {
+      name: defaultNames[segmentKey]?.name || segmentKey,
+      exchange: defaultNames[segmentKey]?.exchange || "NSE",
+      active: false,
+      deactivatedAt: null,
+      activatedAt: null,
+    };
+
+    const now = new Date();
+    const twelveHoursMs = 12 * 60 * 60 * 1000;
+
+    // Reactivation Check against 12-Hour Kill Switch
+    if (targetState === true) {
+      if (currentSeg.deactivatedAt) {
+        const elapsed = now.getTime() - new Date(currentSeg.deactivatedAt).getTime();
+        if (elapsed < twelveHoursMs) {
+          const hoursLeft = ((twelveHoursMs - elapsed) / (1000 * 60 * 60)).toFixed(1);
+          return res.status(403).json({
+            success: false,
+            code: "KILL_SWITCH_ACTIVE",
+            message: `Kill Switch Cooldown Active! This segment was deactivated to prevent overtrading and cannot be reactivated for another ${hoursLeft} hours.`,
+          });
+        }
+      }
+      currentSeg.active = true;
+      currentSeg.activatedAt = now;
+      currentSeg.deactivatedAt = null;
+      if (annualIncome) {
+        user.annualIncome = annualIncome;
+      }
+    } else {
+      // Deactivating via Kill Switch
+      currentSeg.active = false;
+      currentSeg.deactivatedAt = now;
+    }
+
+    user.segments[segmentKey] = currentSeg;
+    user.markModified("segments");
+    await user.save();
+
+    // Audit Notification
+    try {
+      await createNotification({
+        userId,
+        type: "RISK",
+        category: "SYSTEM",
+        title: targetState
+          ? `Segment Activated - ${currentSeg.name}`
+          : `🛑 Kill Switch Active - ${currentSeg.name} Deactivated`,
+        description: targetState
+          ? `Trading is now active for ${currentSeg.name} (${currentSeg.exchange}).`
+          : `Trading in ${currentSeg.name} is disabled. Reactivation is locked for 12 hours as per SEBI Kill Switch risk rules.`,
+        metadata: { actionUrl: "/orders", segmentKey },
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: targetState
+        ? `${currentSeg.name} activated successfully!`
+        : `${currentSeg.name} deactivated via Kill Switch. Locked for 12 hours.`,
+      segments: user.segments,
+    });
+  } catch (err) {
+    console.error("Error updating segment:", err);
+    res.status(500).json({ success: false, message: "Failed to update segment" });
+  }
+});
+
+// Segment Activation Verification OTP
+app.post("/sendSegmentOtp", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const user = await UserModel.findOne({ userId });
+    const userEmail = user?.email || req.body.email;
+    if (!userEmail) {
+      return res.status(400).json({ success: false, message: "No registered email address found for this user account." });
+    }
+    const segmentKey = req.body.segmentKey;
+
+    const generatedOtp = crypto.randomInt(100000, 1000000).toString();
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+
+    await OtpModel.findOneAndUpdate(
+      { email: userEmail.toLowerCase() },
+      {
+        otp: generatedOtp,
+        attempts: 0,
+        expiresAt,
+        createdAt: new Date(),
+      },
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
+    );
+
+    const emailResult = await sendOtpEmail(userEmail, generatedOtp);
+    res.status(200).json({
+      success: true,
+      message: `Verification OTP sent to ${userEmail}`,
+      isLiveEmail: emailResult.delivered,
+      devOtp: emailResult.delivered ? undefined : generatedOtp,
+    });
+  } catch (err) {
+    console.error("Error sending segment OTP:", err);
+    res.status(500).json({ success: false, message: "Failed to send verification code" });
+  }
+});
+
+app.post("/verifySegmentOtp", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const user = await UserModel.findOne({ userId });
+    const userEmail = (user?.email || req.body.email || "").toLowerCase();
+    const { otp, segmentKey, annualIncome } = req.body;
+
+    const otpRecord = await OtpModel.findOne({ email: userEmail });
+    if (!otpRecord) {
+      return res.status(400).json({ success: false, message: "No OTP found or expired. Please request a new code." });
+    }
+    if (new Date() > otpRecord.expiresAt) {
+      return res.status(400).json({ success: false, message: "OTP has expired. Please request a new one." });
+    }
+    if (otpRecord.otp !== otp?.toString().trim()) {
+      return res.status(400).json({ success: false, message: "Invalid verification code entered." });
+    }
+
+    // Activate segment
+    if (!user.segments) user.segments = {};
+    const defaultNames = {
+      equity: { name: "NSE & BSE Equity (Cash)", exchange: "NSE, BSE" },
+      futuresAndOptions: { name: "Futures & Options (F&O)", exchange: "NFO, BFO" },
+      currency: { name: "Currency Derivatives (CDS)", exchange: "CDS, BCD" },
+      commodity: { name: "Commodity Derivatives", exchange: "MCX" },
+    };
+
+    const currentSeg = user.segments[segmentKey] || {
+      name: defaultNames[segmentKey]?.name || segmentKey,
+      exchange: defaultNames[segmentKey]?.exchange || "NSE",
+      active: true,
+      deactivatedAt: null,
+      activatedAt: new Date(),
+    };
+    currentSeg.active = true;
+    currentSeg.activatedAt = new Date();
+    currentSeg.deactivatedAt = null;
+
+    user.segments[segmentKey] = currentSeg;
+    if (annualIncome) user.annualIncome = annualIncome;
+    user.markModified("segments");
+    await user.save();
+
+    await OtpModel.deleteOne({ _id: otpRecord._id });
+
+    try {
+      await createNotification({
+        userId,
+        type: "RISK",
+        category: "SYSTEM",
+        title: `Segment Activated - ${currentSeg.name}`,
+        description: `Trading is now active for ${currentSeg.name} (${currentSeg.exchange}) with verified income declaration.`,
+        metadata: { actionUrl: "/orders", segmentKey },
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: `${currentSeg.name} verified and activated!`,
+      segments: user.segments,
+    });
+  } catch (err) {
+    console.error("Error verifying segment OTP:", err);
+    res.status(500).json({ success: false, message: "Verification failed." });
+  }
+});
+
+
+// ============================================================================
+// 9. CDSL E-DIS DEMAT AUTHORIZATION (TPIN & TRANSACTION OTP VIA EMAIL)
+// ============================================================================
+
+app.post("/cdsl/generate-tpin", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const user = await UserModel.findOne({ userId });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const generatedTpin = crypto.randomInt(100000, 1000000).toString();
+    user.cdslTpin = generatedTpin;
+    await user.save();
+
+    const toEmail = user.email;
+    if (!toEmail) {
+      return res.status(400).json({ success: false, message: "No registered email found for this user account. Please update your profile email." });
+    }
+    const emailResult = await sendCdslTpinEmail(toEmail, generatedTpin, user.demat);
+
+    console.log(`🔐 [CDSL TPIN DISPATCHED] TPIN for user ${userId} (${toEmail}): ${generatedTpin}`);
+
+    res.status(200).json({
+      success: true,
+      message: `Your 6-digit CDSL TPIN has been sent to ${toEmail}`,
+      isLiveEmail: emailResult.delivered,
+      devTpin: emailResult.delivered ? undefined : generatedTpin,
+    });
+  } catch (err) {
+    console.error("Error generating CDSL TPIN:", err);
+    res.status(500).json({ success: false, message: "Failed to dispatch CDSL TPIN" });
+  }
+});
+
+app.post("/cdsl/verify-tpin", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const { tpin, stockName, stockQty } = req.body;
+    const user = await UserModel.findOne({ userId });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    if (!user.cdslTpin) {
+      return res.status(400).json({
+        success: false,
+        message: "No CDSL TPIN found for this account. Please click 'Generate New TPIN' to receive one on your registered email.",
+      });
+    }
+
+    if (tpin !== user.cdslTpin) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid CDSL TPIN entered. Please check the code sent to your registered email.",
+      });
+    }
+
+    // TPIN is valid -> Generate Transaction OTP
+    const generatedOtp = crypto.randomInt(100000, 1000000).toString();
+    const toEmail = (user.email || "").toLowerCase();
+    if (!toEmail) {
+      return res.status(400).json({ success: false, message: "No registered email address found for this user account." });
+    }
+
+    // Store in OtpModel with cdsl identifier
+    const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+    await OtpModel.findOneAndUpdate(
+      { email: `${toEmail}_cdsl_otp` },
+      {
+        otp: generatedOtp,
+        attempts: 0,
+        expiresAt,
+        createdAt: new Date(),
+      },
+      { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
+    );
+
+    const emailResult = await sendCdslTransactionOtpEmail(toEmail, generatedOtp, stockName, stockQty);
+
+    console.log(`🔐 [CDSL OTP DISPATCHED] Transaction OTP for ${userId} (${toEmail}): ${generatedOtp}`);
+
+    res.status(200).json({
+      success: true,
+      message: `Transaction OTP sent to ${toEmail}`,
+      isLiveEmail: emailResult.delivered,
+      devOtp: emailResult.delivered ? undefined : generatedOtp,
+    });
+  } catch (err) {
+    console.error("Error verifying CDSL TPIN:", err);
+    res.status(500).json({ success: false, message: "Failed to verify TPIN" });
+  }
+});
+
+app.post("/cdsl/verify-otp", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+    const { otp, stockName } = req.body;
+    const user = await UserModel.findOne({ userId });
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    const toEmail = (user.email || "").toLowerCase();
+    const otpRecord = await OtpModel.findOne({ email: `${toEmail}_cdsl_otp` });
+
+    if (!otpRecord) {
+      return res.status(400).json({
+        success: false,
+        message: "No active CDSL transaction OTP found or expired. Please re-enter your TPIN.",
+      });
+    }
+
+    if (new Date() > otpRecord.expiresAt) {
+      return res.status(400).json({
+        success: false,
+        message: "CDSL transaction OTP has expired. Please request a new code.",
+      });
+    }
+
+    if (otpRecord.otp !== otp?.toString().trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid transaction OTP entered. Please check the code sent to your email.",
+      });
+    }
+
+    await OtpModel.deleteOne({ _id: otpRecord._id });
+
+    // In-App Notification
+    try {
+      await createNotification({
+        userId,
+        type: "ORDER",
+        category: "SYSTEM",
+        title: "CDSL Demat Authorized",
+        description: `Demat account authorized via CDSL E-DIS for exit transactions today until 3:30 PM.`,
+        metadata: { actionUrl: "/holdings" },
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: "Demat holdings authorized successfully! Valid until 3:30 PM today.",
+    });
+  } catch (err) {
+    console.error("Error verifying CDSL OTP:", err);
+    res.status(500).json({ success: false, message: "Failed to verify OTP" });
   }
 });
 

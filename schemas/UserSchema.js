@@ -94,6 +94,39 @@ const UserSchema = new Schema({
     type: NomineeSubSchema,
     default: null,
   },
+  segments: {
+    type: Object,
+    default: () => ({
+      equity: {
+        name: "NSE & BSE Equity (Cash)",
+        exchange: "NSE, BSE",
+        active: true,
+        deactivatedAt: null,
+        activatedAt: new Date(),
+      },
+      futuresAndOptions: {
+        name: "Futures & Options (F&O)",
+        exchange: "NFO, BFO",
+        active: true,
+        deactivatedAt: null,
+        activatedAt: new Date(),
+      },
+      currency: {
+        name: "Currency Derivatives (CDS)",
+        exchange: "CDS, BCD",
+        active: false,
+        deactivatedAt: null,
+        activatedAt: null,
+      },
+      commodity: {
+        name: "Commodity Derivatives",
+        exchange: "MCX",
+        active: false,
+        deactivatedAt: null,
+        activatedAt: null,
+      },
+    }),
+  },
   role: { 
     type: String, 
     enum: ["user", "admin"], 
@@ -102,6 +135,10 @@ const UserSchema = new Schema({
   avatarText: { 
     type: String, 
     default: "TR" 
+  },
+  cdslTpin: {
+    type: String,
+    default: "",
   },
   createdAt: { 
     type: Date, 

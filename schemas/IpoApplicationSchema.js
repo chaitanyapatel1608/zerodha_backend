@@ -7,7 +7,6 @@ const IpoApplicationSchema = new Schema(
       type: String,
       required: true,
       index: true,
-      default: "ZU9344",
     },
     userEmail: {
       type: String,
