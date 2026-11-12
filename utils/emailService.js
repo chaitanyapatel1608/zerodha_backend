@@ -9,13 +9,10 @@ async function sendOtpEmail(toEmail, otp) {
   const emailPass = process.env.EMAIL_PASS;
 
   if (!emailUser || !emailPass) {
-    console.log(
-      `⚠️ [EMAIL SERVICE] EMAIL_USER / EMAIL_PASS not set in backend/.env. Simulated OTP for ${toEmail}: ${otp}`
-    );
+    console.warn("[EMAIL SERVICE] SMTP credentials not configured; OTP delivery skipped.");
     return {
       delivered: false,
       reason: "CREDENTIALS_NOT_CONFIGURED",
-      devOtp: otp,
     };
   }
 
@@ -84,7 +81,6 @@ async function sendOtpEmail(toEmail, otp) {
     return {
       delivered: false,
       reason: error.message,
-      devOtp: otp,
     };
   }
 }
@@ -580,8 +576,8 @@ async function sendCdslTpinEmail(toEmail, tpin, dematBoId) {
   const emailPass = process.env.EMAIL_PASS;
 
   if (!emailUser || !emailPass) {
-    console.log(`⚠️ [EMAIL SERVICE] Simulated CDSL TPIN for ${toEmail}: ${tpin}`);
-    return { delivered: false, devTpin: tpin };
+    console.warn("[EMAIL SERVICE] SMTP credentials not configured; CDSL TPIN delivery skipped.");
+    return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
   }
 
   try {
@@ -658,8 +654,8 @@ async function sendCdslTransactionOtpEmail(toEmail, otp, stockName, stockQty) {
   const emailPass = process.env.EMAIL_PASS;
 
   if (!emailUser || !emailPass) {
-    console.log(`⚠️ [EMAIL SERVICE] Simulated CDSL OTP for ${toEmail}: ${otp}`);
-    return { delivered: false, devOtp: otp };
+    console.warn("[EMAIL SERVICE] SMTP credentials not configured; CDSL OTP delivery skipped.");
+    return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
   }
 
   try {

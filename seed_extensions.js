@@ -1,5 +1,14 @@
 require("dotenv").config();
 const mongoose = require("mongoose");
+
+if (process.env.NODE_ENV === "production") {
+  console.error("FATAL: Seed scripts are strictly prohibited in production.");
+  process.exit(1);
+}
+if (!process.argv.includes("--confirm-seed") && process.env.ALLOW_DESTRUCTIVE_SEED !== "true") {
+  console.error("ABORTED: Pass --confirm-seed or ALLOW_DESTRUCTIVE_SEED=true to run seed_extensions.js in non-production.");
+  process.exit(1);
+}
 const { WatchlistModel } = require("./model/WatchlistModel");
 const { FundsModel } = require("./model/FundsModel");
 const { HoldingsModel } = require("./model/HoldingsModel");

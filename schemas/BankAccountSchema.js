@@ -1,4 +1,5 @@
 const { Schema } = require("mongoose");
+const { encryptField } = require("../utils/encryption");
 
 const BankAccountSchema = new Schema({
   userId: { type: String, required: true },
@@ -12,6 +13,12 @@ const BankAccountSchema = new Schema({
   status: { type: String, enum: ["VERIFIED", "PENDING_VERIFICATION"], default: "VERIFIED" },
   pennyDropRef: { type: String },
   createdAt: { type: Date, default: Date.now },
+});
+
+BankAccountSchema.pre("save", async function () {
+  if (this.accountNumber) {
+    this.accountNumber = encryptField(this.accountNumber);
+  }
 });
 
 module.exports = { BankAccountSchema };
