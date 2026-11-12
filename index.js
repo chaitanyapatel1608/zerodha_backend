@@ -1,18 +1,53 @@
-const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, ".env") });
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
-const bodyParser = require("body-parser");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
-const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
+const {
+  NODE_ENV,
+  IS_PROD,
+  IS_TEST,
+  PORT,
+  MONGO_URL: uri,
+  JWT_SECRET,
+  PUBLIC_FRONTEND_URL,
+  PUBLIC_BACKEND_URL,
+  ALLOWED_ORIGINS: allowedOrigins,
+} = require("./config/env");
+const logger = require("./utils/logger");
+const {
+  hashPassword,
+  verifyPassword,
+  constantTimeEquals,
+  escapeRegex,
+  isValidObjectId,
+} = require("./utils/security");
+const { getAuthenticatedUserId, requireAuth } = require("./middleware/auth");
+const { otpLimiter, authLimiter, tradeFundsLimiter } = require("./middleware/rateLimiters");
+const {
+  toPaise,
+  fromPaise,
+  addPaise,
+  subPaise,
+  formatPaiseINR,
+  formatIndianCurrency,
+  validatePositiveAmount,
+} = require("./utils/money");
+const { escapeHtml, renderConfirmationPage } = require("./utils/html");
+const { decryptField } = require("./utils/encryption");
+const { withUserLock, acquireDistributedLock, releaseDistributedLock } = require("./utils/locks");
+const { runInTransaction } = require("./utils/transactions");
+const healthRoutes = require("./routes/healthRoutes");
 
 const { HoldingsModel } = require("./model/HoldingsModel");
 const { PositionsModel } = require("./model/PositionsModel");
 const { OrdersModel } = require("./model/OrdersModel");
 const { WatchlistModel } = require("./model/WatchlistModel");
 const { FundsModel } = require("./model/FundsModel");
+const { FundsTransactionModel } = require("./model/FundsTransactionModel");
+const { PledgedCollateralModel } = require("./model/PledgedCollateralModel");
+const { BankAccountModel } = require("./model/BankAccountModel");
 const { IpoModel } = require("./model/IpoModel");
 const { IpoApplicationModel } = require("./model/IpoApplicationModel");
 const { GsecBidModel } = require("./model/GsecBidModel");
@@ -27,11 +62,13 @@ const { BasketModel } = require("./model/BasketModel");
 const { SipModel } = require("./model/SipModel");
 const { UserWatchlistModel } = require("./model/UserWatchlistModel");
 const { NotificationModel } = require("./model/NotificationModel");
+const { SupportTicketModel } = require("./model/SupportTicketModel");
 const { masterInstruments } = require("./data/masterInstruments");
 const { OtpModel } = require("./model/OtpModel");
 const {
   sendOtpEmail,
   sendIpoMandateEmail,
+  sendFundDepositEmail,
   sendSipFailureEmail,
   sendSipSuccessEmail,
   sendAlertTriggeredEmail,
@@ -46,31 +83,91 @@ const AlertModel = require("./model/AlertModel");
 const { seedCatalogsToDb } = require("./data/seedCatalogsToDb");
 
 const app = express();
-const PORT = process.env.PORT || 3002;
-const uri = process.env.MONGO_URL;
-const JWT_SECRET = process.env.JWT_SECRET || "zerodha_jwt_super_secret_key_2026_finance_kite";
 
-// Middlewares
-app.use(cors());
-app.use(bodyParser.json());
+// Middlewares & Security Headers
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  })
+);
 
-// Rate Limiter for OTP requests (15 requests per 10 minutes per IP)
-const otpLimiter = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 15,
-  message: { success: false, message: "Too many OTP requests. Please wait a few minutes before trying again." },
-  standardHeaders: true,
-  legacyHeaders: false,
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin) || !IS_PROD) {
+        return callback(null, true);
+      }
+      return callback(new Error("CORS origin blocked by policy: " + origin));
+    },
+    credentials: true,
+  })
+);
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+app.use(healthRoutes);
+
+// Global ObjectId pre-validation for all :id routes (prevents CastError 500s)
+app.param("id", (req, res, next, id) => {
+  if (!isValidObjectId(String(id))) {
+    return res.status(400).json({ success: false, message: "Invalid resource identifier" });
+  }
+  return next();
 });
+
+function buildCookieOptions(req, httpOnly) {
+  const isSecure = IS_PROD || Boolean(req?.secure) || req?.headers?.["x-forwarded-proto"] === "https";
+  const opts = {
+    httpOnly,
+    secure: isSecure,
+    sameSite: "lax",
+    path: "/",
+    maxAge: 24 * 60 * 60 * 1000,
+  };
+  if (process.env.COOKIE_DOMAIN) {
+    opts.domain = process.env.COOKIE_DOMAIN;
+  }
+  return opts;
+}
+
+function issueAuthSession(res, req, user) {
+  const token = jwt.sign(
+    {
+      userId: user.userId,
+      email: user.email,
+      role: user.role,
+      tv: user.tokenVersion || 0,
+    },
+    JWT_SECRET,
+    { expiresIn: "24h" }
+  );
+  const csrfToken = crypto.randomBytes(32).toString("hex");
+  res.cookie("zerodha_session", token, buildCookieOptions(req, true));
+  res.cookie("zerodha_csrf", csrfToken, buildCookieOptions(req, false));
+  res.setHeader("Cache-Control", "no-store");
+  return token;
+}
+
+function clearAuthCookies(res, req) {
+  const baseHttpOnly = buildCookieOptions(req, true);
+  const baseReadable = buildCookieOptions(req, false);
+  delete baseHttpOnly.maxAge;
+  delete baseReadable.maxAge;
+  res.clearCookie("zerodha_session", baseHttpOnly);
+  res.clearCookie("zerodha_csrf", baseReadable);
+  res.setHeader("Cache-Control", "no-store");
+}
 
 // MongoDB Connection
 mongoose
   .connect(uri)
   .then(() => {
-    console.log("DB connected successfully!");
+    logger.info("db_connected");
     seedCatalogsToDb();
   })
-  .catch((err) => console.error("DB connection error:", err));
+  .catch((err) => logger.error("db_connection_error", { message: err.message }));
 
 // ==========================================
 // Authentication Routes (Passwordless OTP)
@@ -86,7 +183,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
       const cleanId = identifier.trim();
       const existing = await UserModel.findOne({
         $or: [
-          { userId: { $regex: new RegExp(`^${cleanId}$`, "i") } },
+          { userId: { $regex: new RegExp(`^${escapeRegex(cleanId)}$`, "i") } },
           { email: cleanId.toLowerCase() },
           { phone: cleanId },
         ],
@@ -190,7 +287,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
         ? `A 6-digit verification code has been sent to ${normalizedEmail}`
         : `Verification code sent to ${normalizedEmail}`,
       isLiveEmail: emailResult.delivered,
-      devOtp: emailResult.delivered ? undefined : generatedOtp,
+      devOtp: process.env.NODE_ENV === "test" ? generatedOtp : undefined,
     });
   } catch (error) {
     console.error("Error sending OTP:", error);
@@ -199,7 +296,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
 });
 
 // 2. Verify OTP Endpoint (Unified Signup & Login)
-app.post("/verify-otp", async (req, res) => {
+app.post("/verify-otp", authLimiter, async (req, res) => {
   try {
     const { email, otp, type, fullName, phone, pan, dob, annualIncome, tradingExp } = req.body;
 
@@ -263,8 +360,8 @@ app.post("/verify-otp", async (req, res) => {
       });
     }
 
-    // Compare OTP
-    if (otpRecord.otp !== cleanOtp) {
+    // Compare OTP in constant time
+    if (!constantTimeEquals(String(otpRecord.otp), cleanOtp)) {
       otpRecord.attempts += 1;
       await otpRecord.save();
       const remaining = 5 - otpRecord.attempts;
@@ -298,7 +395,7 @@ app.post("/verify-otp", async (req, res) => {
 
     if (!user) {
       // Generate unique Zerodha Kite client ID (e.g., ZU + 4 digits)
-      const randomId = Math.floor(1000 + Math.random() * 9000);
+      const randomId = crypto.randomInt(1000, 10000);
       const generatedUserId = `ZU${randomId}`;
       const name = fullName && fullName.trim() ? fullName.trim() : "Trader";
       const initials = name
@@ -324,7 +421,7 @@ app.post("/verify-otp", async (req, res) => {
         lastLogin: new Date(),
       });
       await user.save();
-      console.log(`👤 [NEW USER PROVISIONED] ${user.userId} (${user.email}) - PAN: ${user.pan}`);
+      logger.info("user_provisioned", { userId: user.userId });
     } else {
       user.lastLogin = new Date();
       if (fullName && fullName.trim()) {
@@ -346,16 +443,8 @@ app.post("/verify-otp", async (req, res) => {
       console.log(`🔓 [USER LOGGED IN] ${user.userId} (${user.email}) - Name: ${user.fullName}`);
     }
 
-    // Sign stateless JWT
-    const token = jwt.sign(
-      {
-        userId: user.userId,
-        email: user.email,
-        role: user.role,
-      },
-      JWT_SECRET,
-      { expiresIn: "24h" }
-    );
+    // Sign versioned JWT and issue HttpOnly session + CSRF cookies
+    const token = issueAuthSession(res, req, user);
 
     return res.status(200).json({
       success: true,
@@ -365,9 +454,9 @@ app.post("/verify-otp", async (req, res) => {
         userId: user.userId,
         email: user.email,
         fullName: user.fullName,
-        phone: user.phone || "",
-        pan: user.pan || "",
-        dob: user.dob || "",
+        phone: decryptField(user.phone || ""),
+        pan: decryptField(user.pan || ""),
+        dob: decryptField(user.dob || ""),
         demat: user.demat || "1208160012345678",
         annualIncome: user.annualIncome || "₹1L - ₹5L",
         tradingExp: user.tradingExp || "1-3 Years",
@@ -382,53 +471,59 @@ app.post("/verify-otp", async (req, res) => {
   }
 });
 
-// 2.5 Kite Direct / Password Login & Lookup Endpoint
-app.post("/kite-login", async (req, res) => {
+// 2.5 Kite Direct Password Login Endpoint
+app.post("/kite-login", authLimiter, async (req, res) => {
   try {
     const { identifier, password } = req.body;
-    if (!identifier || !identifier.trim()) {
+    if (!identifier || typeof identifier !== "string" || !identifier.trim()) {
       return res.status(400).json({ success: false, message: "User ID, Phone number, or Email is required" });
     }
+    if (!password || typeof password !== "string" || password.length === 0) {
+      return res.status(400).json({ success: false, message: "Password is required for password-based login." });
+    }
+
     const cleanId = identifier.trim();
     const user = await UserModel.findOne({
       $or: [
-        { userId: { $regex: new RegExp(`^${cleanId}$`, "i") } },
+        { userId: { $regex: new RegExp(`^${escapeRegex(cleanId)}$`, "i") } },
         { email: cleanId.toLowerCase() },
         { phone: cleanId },
       ],
     });
 
     if (!user) {
-      return res.status(404).json({
+      return res.status(401).json({
         success: false,
-        code: "USER_NOT_FOUND",
-        message: `No Zerodha account registered with '${cleanId}'. Please open a new account to continue.`,
+        code: "INVALID_CREDENTIALS",
+        message: "Invalid account identifier or password.",
       });
     }
 
-    if (user.password && password) {
-      if (user.password !== password) {
-        return res.status(401).json({ success: false, message: "Incorrect password. Please try again." });
-      }
-    } else if (password && !user.password) {
-      user.password = password;
-      await user.save();
+    if (!user.password) {
+      return res.status(403).json({
+        success: false,
+        code: "PASSWORD_NOT_INITIALIZED",
+        message: "Password login is not enabled for this account. Please sign in with OTP verification first.",
+      });
+    }
+
+    const isValid = verifyPassword(password, user.password);
+    if (!isValid) {
+      logger.warn("kite_login_failed", { userId: user.userId });
+      return res.status(401).json({ success: false, message: "Incorrect password. Please try again." });
+    }
+
+    // Transparently upgrade legacy plaintext password to scrypt digest on verified login
+    if (!user.password.includes(":")) {
+      user.password = hashPassword(password);
     }
 
     user.lastLogin = new Date();
     await user.save();
 
-    const token = jwt.sign(
-      {
-        userId: user.userId,
-        email: user.email,
-        role: user.role,
-      },
-      JWT_SECRET,
-      { expiresIn: "24h" }
-    );
+    const token = issueAuthSession(res, req, user);
 
-    console.log(`🚀 [KITE LOGIN SUCCESS] ${user.userId} (${user.email}) - Terminal Launched`);
+    logger.info("kite_login_success", { userId: user.userId });
 
     return res.status(200).json({
       success: true,
@@ -439,9 +534,7 @@ app.post("/kite-login", async (req, res) => {
         email: user.email,
         fullName: user.fullName,
         phone: user.phone || "",
-        pan: user.pan || "",
-        dob: user.dob || "",
-        demat: user.demat || "1208160012345678",
+        demat: user.demat || "",
         annualIncome: user.annualIncome || "₹1L - ₹5L",
         tradingExp: user.tradingExp || "1-3 Years",
         broker: user.broker || "Zerodha Broking Ltd.",
@@ -450,51 +543,18 @@ app.post("/kite-login", async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error in kite-login:", error);
+    logger.error("kite_login_error", { message: error.message });
     return res.status(500).json({ success: false, message: "Internal server error during login" });
   }
 });
 
 // 3. Verify Active Session Token
-
-// Helper: Resolve dynamic userId from JWT token, query param, or request body (strictly multi-user)
-function getAuthenticatedUserId(req) {
-  const authHeader = req.headers?.authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    try {
-      const token = authHeader.split(" ")[1];
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded && decoded.userId) {
-        return decoded.userId;
-      }
-    } catch (e) {}
-  }
-  const explicitId = req.query?.userId || req.body?.userId;
-  if (explicitId && typeof explicitId === "string" && explicitId.trim() !== "") {
-    return explicitId.trim();
-  }
-  return null;
-}
-
-app.get("/verifyUser", async (req, res) => {
+app.get("/verifyUser", requireAuth, async (req, res) => {
   try {
-    let resolvedUserId = null;
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith("Bearer ")) {
-      try {
-        const token = authHeader.split(" ")[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        resolvedUserId = decoded?.userId;
-      } catch (e) {}
-    }
-    if (!resolvedUserId && req.query?.userId) {
-      resolvedUserId = req.query.userId.trim();
-    }
-    if (!resolvedUserId) {
-      return res.status(401).json({ success: false, message: "User identity or token required" });
-    }
-
-    const user = await UserModel.findOne({ userId: resolvedUserId }).select("-__v");
+    const resolvedUserId = req.authUserId;
+    const user = await UserModel.findOne({ userId: resolvedUserId }).select(
+      "-password -cdslTpin -cdslAttempts -cdslLockedUntil -__v"
+    );
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
@@ -505,10 +565,9 @@ app.get("/verifyUser", async (req, res) => {
         userId: user.userId,
         email: user.email,
         fullName: user.fullName,
-        phone: user.phone || "",
-        pan: user.pan || "",
-        dob: user.dob || "",
-        demat: user.demat || ("12081600" + Math.floor(10000000 + Math.random() * 90000000)),
+        phone: decryptField(user.phone || ""),
+        pan: decryptField(user.pan || ""),
+        demat: user.demat || "",
         annualIncome: user.annualIncome || "₹1L - ₹5L",
         tradingExp: user.tradingExp || "1-3 Years",
         broker: user.broker || "Zerodha Broking Ltd.",
@@ -516,6 +575,10 @@ app.get("/verifyUser", async (req, res) => {
         role: user.role,
         nomineeStatus: user.nomineeStatus || "PENDING",
         nominees: user.nominees || [],
+        cdslAuthorizedUntil: user.cdslAuthorizedUntil || null,
+        isCdslAuthorizedToday: Boolean(
+          user.cdslAuthorizedUntil && new Date() <= new Date(user.cdslAuthorizedUntil)
+        ),
       },
     });
   } catch (error) {
@@ -523,11 +586,25 @@ app.get("/verifyUser", async (req, res) => {
   }
 });
 
+// 4. Logout & Server-Side Token Revocation
+app.post("/logout", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    await UserModel.updateOne({ userId }, { $inc: { tokenVersion: 1 } });
+    clearAuthCookies(res, req);
+    logger.info("user_logged_out", { userId });
+    return res.status(200).json({ success: true, message: "Logged out securely." });
+  } catch (error) {
+    logger.error("logout_error", { error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to log out" });
+  }
+});
+
 // ==========================================
 // Core Trading & Market Data Routes
 // ==========================================
 
-app.get("/allHoldings", async (req, res) => {
+app.get("/allHoldings", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -541,7 +618,7 @@ app.get("/allHoldings", async (req, res) => {
   }
 });
 
-app.get("/allPositions", async (req, res) => {
+app.get("/allPositions", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -560,7 +637,7 @@ app.get("/allPositions", async (req, res) => {
 // ==========================================
 
 // 1. Square Off Single Position (MIS or Overnight)
-app.post("/squareOffPosition", async (req, res) => {
+app.post("/squareOffPosition", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -650,7 +727,7 @@ app.post("/squareOffPosition", async (req, res) => {
 });
 
 // 2. Square Off All Open Positions (Emergency / 15:20 RMS Square Off)
-app.post("/squareOffAllPositions", async (req, res) => {
+app.post("/squareOffAllPositions", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -740,7 +817,7 @@ app.post("/squareOffAllPositions", async (req, res) => {
 });
 
 // 3. Convert Position (MIS <-> CNC/NRML)
-app.post("/convertPosition", async (req, res) => {
+app.post("/convertPosition", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -870,7 +947,7 @@ app.post("/convertPosition", async (req, res) => {
   }
 });
 
-app.get("/allOrders", async (req, res) => {
+app.get("/allOrders", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -916,18 +993,20 @@ async function createNotification({
   }
 }
 
-// Helper: Strictly isolate user funds per tenant/user account
-async function getOrCreateUserFunds(userId) {
+// Helper: Strictly isolate user funds per tenant/user account (transaction-session aware)
+async function getOrCreateUserFunds(userId, session = null) {
   if (!userId) return null;
-  let funds = await FundsModel.findOne({ userId });
+  const query = FundsModel.findOne({ userId });
+  if (session) query.session(session);
+  let funds = await query;
   if (!funds) {
     funds = new FundsModel({
       userId,
       equity: {
-        availableMargin: "1,24,500.00",
+        availableMargin: "0.00",
         usedMargin: "0.00",
-        availableCash: "1,24,500.00",
-        openingBalance: "1,24,500.00",
+        availableCash: "0.00",
+        openingBalance: "0.00",
       },
       commodity: {
         availableMargin: "0.00",
@@ -936,8 +1015,8 @@ async function getOrCreateUserFunds(userId) {
         openingBalance: "0.00",
       },
     });
-    await funds.save();
-    console.log(`💰 [USER FUNDS INITIALIZED] Initialized fresh margin for user: ${userId}`);
+    await funds.save(session ? { session } : undefined);
+    logger.info("user_funds_initialized", { userId });
   }
   return funds;
 }
@@ -997,36 +1076,43 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
 
   const orderMode = mode.toUpperCase();
   const orderProduct = product.toUpperCase();
-  const orderCost = numQty * numPrice;
-  const marginRequired = orderProduct === "MIS" ? orderCost * 0.2 : orderCost;
-
-  let funds = await getOrCreateUserFunds(userId);
-  if (!funds) {
-    return {
-      success: false,
-      code: "FUNDS_UNAVAILABLE",
-      message: "Unable to retrieve or initialize trading funds for this user account.",
-    };
+  if (!["BUY", "SELL"].includes(orderMode) || !["CNC", "MIS", "NRML"].includes(orderProduct)) {
+    return { success: false, message: "Invalid order mode or product type." };
   }
+  const orderCostPaise = Math.round(numQty * toPaise(numPrice));
+  const marginRequiredPaise = orderProduct === "MIS" ? Math.round(orderCostPaise * 0.2) : orderCostPaise;
+  const orderCost = fromPaise(orderCostPaise);
 
-  let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
-  let currentUsed = parseFloat(funds.equity.usedMargin.replace(/,/g, "")) || 0;
+  return await withUserLock(`trade:${userId}`, async () =>
+    runInTransaction(async (session) => {
+      const sOpt = session ? { session } : undefined;
+      let funds = await getOrCreateUserFunds(userId, session);
+      if (!funds) {
+        return {
+          success: false,
+          code: "FUNDS_UNAVAILABLE",
+          message: "Unable to retrieve or initialize trading funds for this user account.",
+        };
+      }
 
-  if (orderMode === "BUY") {
-    if (currentAvailable < marginRequired) {
-      return {
-        success: false,
-        code: "INSUFFICIENT_MARGIN",
-        message: `Insufficient margin! Margin required: ₹${formatIndianCurrency(marginRequired)}, but available margin is only ₹${formatIndianCurrency(currentAvailable)}.`,
-      };
-    }
+      let currentAvailablePaise = toPaise(funds.equity.availableMargin);
+      let currentUsedPaise = toPaise(funds.equity.usedMargin);
 
-    currentAvailable -= marginRequired;
-    currentUsed += marginRequired;
-    funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-    funds.equity.usedMargin = formatIndianCurrency(currentUsed);
-    funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-    await funds.save();
+      if (orderMode === "BUY") {
+        if (currentAvailablePaise < marginRequiredPaise) {
+          return {
+            success: false,
+            code: "INSUFFICIENT_MARGIN",
+            message: `Insufficient margin! Margin required: ₹${formatPaiseINR(marginRequiredPaise)}, but available margin is only ₹${formatPaiseINR(currentAvailablePaise)}.`,
+          };
+        }
+
+        currentAvailablePaise = subPaise(currentAvailablePaise, marginRequiredPaise);
+        currentUsedPaise = addPaise(currentUsedPaise, marginRequiredPaise);
+        funds.equity.availableMargin = formatPaiseINR(currentAvailablePaise);
+        funds.equity.usedMargin = formatPaiseINR(currentUsedPaise);
+        funds.equity.availableCash = formatPaiseINR(currentAvailablePaise);
+        await funds.save(sOpt);
 
     if (orderProduct === "CNC") {
       let existingHolding = await HoldingsModel.findOne({
@@ -1137,6 +1223,17 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
     }
   } else if (orderMode === "SELL") {
     if (orderProduct === "CNC") {
+      // Server-side CDSL E-DIS authorization gate for CNC Demat sell orders
+      const seller = await UserModel.findOne({ userId }).select("cdslAuthorizedUntil");
+      if (!seller || !seller.cdslAuthorizedUntil || new Date() > new Date(seller.cdslAuthorizedUntil)) {
+        return {
+          success: false,
+          code: "CDSL_AUTH_REQUIRED",
+          message:
+            "CDSL E-DIS authorization required before selling CNC Demat holdings. Please verify your TPIN and OTP.",
+        };
+      }
+
       let existingHolding = await HoldingsModel.findOne({
         userId,
         $or: [{ name }, { instrument: name }],
@@ -1159,13 +1256,13 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
         await existingHolding.save();
       }
 
-      const proceeds = numQty * numPrice;
-      currentAvailable += proceeds;
-      currentUsed = Math.max(0, currentUsed - proceeds);
-      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
-      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-      await funds.save();
+      const proceedsPaise = Math.round(numQty * toPaise(numPrice));
+      currentAvailablePaise = addPaise(currentAvailablePaise, proceedsPaise);
+      currentUsedPaise = Math.max(0, subPaise(currentUsedPaise, proceedsPaise));
+      funds.equity.availableMargin = formatPaiseINR(currentAvailablePaise);
+      funds.equity.usedMargin = formatPaiseINR(currentUsedPaise);
+      funds.equity.availableCash = formatPaiseINR(currentAvailablePaise);
+      await funds.save(sOpt);
     } else {
       let existingPosition = await PositionsModel.findOne({
         userId,
@@ -1227,12 +1324,12 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
         await newPosition.save();
       }
 
-      currentAvailable += marginRequired;
-      currentUsed = Math.max(0, currentUsed - marginRequired);
-      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
-      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-      await funds.save();
+      currentAvailablePaise = addPaise(currentAvailablePaise, marginRequiredPaise);
+      currentUsedPaise = Math.max(0, subPaise(currentUsedPaise, marginRequiredPaise));
+      funds.equity.availableMargin = formatPaiseINR(currentAvailablePaise);
+      funds.equity.usedMargin = formatPaiseINR(currentUsedPaise);
+      funds.equity.availableCash = formatPaiseINR(currentAvailablePaise);
+      await funds.save(sOpt);
     }
   }
 
@@ -1246,7 +1343,7 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
     status: "COMPLETE",
     createdAt: new Date(),
   });
-  const savedOrder = await newOrder.save();
+  const savedOrder = await newOrder.save(sOpt);
 
   // Real-Time Dynamic Notification Dispatch
   try {
@@ -1275,24 +1372,21 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
     order: savedOrder,
     funds: funds.equity,
   };
+    })
+  );
 }
 
-// Helper to format Indian Currency
-const formatIndianCurrency = (num) => {
-  return Number(num).toLocaleString("en-IN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-};
+// Integer-paise formatIndianCurrency is imported from ./utils/money
 
 // 1. Transactional Order Engine with Portfolio & Funds Synchronization
-app.post("/newOrder", async (req, res) => {
+app.post("/newOrder", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const { name, qty, price, mode = "BUY", product = "CNC" } = req.body;
     const userId = getAuthenticatedUserId(req);
     const result = await executeOrderInternal({ name, qty, price, mode, product, userId });
     if (!result.success) {
-      return res.status(400).json(result);
+      const status = result.code === "CDSL_AUTH_REQUIRED" ? 403 : 400;
+      return res.status(status).json(result);
     }
     console.log(`⚡ [ORDER EXECUTED] ${mode} ${qty} ${name} @ ₹${price} (${product}) for ${userId}`);
     return res.status(201).json({
@@ -1302,7 +1396,10 @@ app.post("/newOrder", async (req, res) => {
       funds: result.funds,
     });
   } catch (error) {
-    console.error("Order engine execution error:", error);
+    if (error?.status === 429) {
+      return res.status(429).json({ success: false, message: error.message });
+    }
+    logger.error("order_engine_error", { error: error.message });
     return res.status(500).json({ success: false, message: "Internal server error processing order" });
   }
 });
@@ -1338,18 +1435,28 @@ const defaultTab1Stocks = [
 // GET /masterInstruments - Omnisearch across catalog (Stored in & Fetched from MongoDB Atlas!)
 app.get("/masterInstruments", async (req, res) => {
   try {
-    const q = (req.query.q || "").trim();
-    const sector = (req.query.sector || "").trim();
-    const limit = parseInt(req.query.limit) || 50;
+    const rawQ = req.query.q;
+    const rawSector = req.query.sector;
+    if ((rawQ !== undefined && typeof rawQ !== "string") || (rawSector !== undefined && typeof rawSector !== "string")) {
+      return res.status(400).json({ error: "Invalid query parameter type" });
+    }
+    const q = (rawQ || "").trim();
+    const sector = (rawSector || "").trim();
+    if (q.length > 64 || sector.length > 64) {
+      return res.status(400).json({ error: "Search query exceeds maximum length of 64 characters" });
+    }
+    const parsedLimit = parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 100) : 50;
 
     const query = {};
     if (sector) {
-      query.sector = new RegExp("^" + sector + "$", "i");
+      query.sector = new RegExp("^" + escapeRegex(sector) + "$", "i");
     }
     if (q) {
+      const safeQ = escapeRegex(q);
       query.$or = [
-        { symbol: new RegExp(q, "i") },
-        { name: new RegExp(q, "i") },
+        { symbol: new RegExp(safeQ, "i") },
+        { name: new RegExp(safeQ, "i") },
       ];
     }
 
@@ -1387,7 +1494,7 @@ app.get("/allInstruments", async (req, res) => {
 });
 
 // GET /userWatchlistTabs - Get all 7 tabs metadata (id, name, stock count)
-app.get("/userWatchlistTabs", async (req, res) => {
+app.get("/userWatchlistTabs", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const existing = await UserWatchlistModel.find({ userId });
@@ -1405,23 +1512,7 @@ app.get("/userWatchlistTabs", async (req, res) => {
           count: Array.isArray(tabMap[id].stocks) ? tabMap[id].stocks.length : 0,
         });
       } else {
-        // Tab 1 auto-initializes with default stocks, Tabs 2-7 start empty
-        if (id === 1) {
-          try {
-            const newTab1 = new UserWatchlistModel({
-              userId,
-              tabId: 1,
-              tabName: "Watchlist 1",
-              stocks: defaultTab1Stocks,
-            });
-            await newTab1.save();
-            tabs.push({ tabId: 1, tabName: "Watchlist 1", count: defaultTab1Stocks.length });
-          } catch (err) {
-            tabs.push({ tabId: 1, tabName: "Watchlist 1", count: defaultTab1Stocks.length });
-          }
-        } else {
-          tabs.push({ tabId: id, tabName: `Watchlist ${id}`, count: 0 });
-        }
+        tabs.push({ tabId: id, tabName: `Watchlist ${id}`, count: 0 });
       }
     }
 
@@ -1433,30 +1524,20 @@ app.get("/userWatchlistTabs", async (req, res) => {
 });
 
 // GET /userWatchlist - Get a specific tab's stocks and metadata
-app.get("/userWatchlist", async (req, res) => {
+app.get("/userWatchlist", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const tabId = parseInt(req.query.tabId) || 1;
 
     let tabDoc = await UserWatchlistModel.findOne({ userId, tabId });
     if (!tabDoc) {
-      if (tabId === 1) {
-        tabDoc = new UserWatchlistModel({
-          userId,
-          tabId: 1,
-          tabName: "Watchlist 1",
-          stocks: defaultTab1Stocks,
-        });
-        await tabDoc.save();
-      } else {
-        tabDoc = new UserWatchlistModel({
-          userId,
-          tabId,
-          tabName: `Watchlist ${tabId}`,
-          stocks: [],
-        });
-        await tabDoc.save();
-      }
+      tabDoc = new UserWatchlistModel({
+        userId,
+        tabId,
+        tabName: `Watchlist ${tabId}`,
+        stocks: [],
+      });
+      await tabDoc.save();
     }
 
     return res.status(200).json(tabDoc);
@@ -1467,7 +1548,7 @@ app.get("/userWatchlist", async (req, res) => {
 });
 
 // POST /addWatchlistStock - Add a stock to active tab
-app.post("/addWatchlistStock", async (req, res) => {
+app.post("/addWatchlistStock", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const { tabId = 1, stock } = req.body;
@@ -1481,7 +1562,7 @@ app.post("/addWatchlistStock", async (req, res) => {
         userId,
         tabId: parseInt(tabId),
         tabName: `Watchlist ${tabId}`,
-        stocks: tabId === 1 ? defaultTab1Stocks : [],
+        stocks: [],
       });
     }
 
@@ -1524,7 +1605,7 @@ app.post("/addWatchlistStock", async (req, res) => {
 });
 
 // POST /removeWatchlistStock - Remove a stock from active tab
-app.post("/removeWatchlistStock", async (req, res) => {
+app.post("/removeWatchlistStock", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const { tabId = 1, symbol } = req.body;
@@ -1552,7 +1633,7 @@ app.post("/removeWatchlistStock", async (req, res) => {
 });
 
 // POST /renameWatchlistTab - Rename a watchlist tab
-app.post("/renameWatchlistTab", async (req, res) => {
+app.post("/renameWatchlistTab", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const { tabId = 1, tabName } = req.body;
@@ -1567,7 +1648,7 @@ app.post("/renameWatchlistTab", async (req, res) => {
         userId,
         tabId: parseInt(tabId),
         tabName: cleanName,
-        stocks: tabId === 1 ? defaultTab1Stocks : [],
+        stocks: [],
       });
     } else {
       tabDoc.tabName = cleanName;
@@ -1586,9 +1667,9 @@ app.post("/renameWatchlistTab", async (req, res) => {
   }
 });
 
-app.get("/userFunds", async (req, res) => {
+app.get("/userFunds", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(400).json({ error: "User ID is required to fetch funds" });
     }
@@ -1621,12 +1702,13 @@ app.get("/allIpos", async (req, res) => {
 });
 
 // Add or Update Demat Nominee (SEBI Compliance - Up to 3 Nominees)
-app.post("/addNominee", async (req, res) => {
+app.post("/addNominee", requireAuth, async (req, res) => {
   try {
-    const { userId, nominees, optOut } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { nominees, optOut } = req.body;
 
     if (!userId) {
-      return res.status(400).json({ success: false, message: "User ID is required." });
+      return res.status(401).json({ success: false, message: "Authentication required." });
     }
 
     const user = await UserModel.findOne({ userId });
@@ -1806,11 +1888,11 @@ app.post("/addNominee", async (req, res) => {
 });
 
 // Get Nominee Status & Details
-app.get("/getNominee", async (req, res) => {
+app.get("/getNominee", requireAuth, async (req, res) => {
   try {
-    const { userId } = req.query;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
-      return res.status(400).json({ success: false, message: "User ID is required" });
+      return res.status(401).json({ success: false, message: "Authentication required" });
     }
     const user = await UserModel.findOne({ userId });
     if (!user) {
@@ -1818,7 +1900,7 @@ app.get("/getNominee", async (req, res) => {
     }
 
     if (!user.demat) {
-      user.demat = "12081600" + Math.floor(10000000 + Math.random() * 90000000);
+      user.demat = "12081600" + crypto.randomInt(10000000, 100000000);
       await user.save();
     }
 
@@ -1845,7 +1927,7 @@ app.get("/getNominee", async (req, res) => {
 // Phase 4: GTT (Good Till Triggered) Engine
 // ==========================================
 
-app.get("/allGtt", async (req, res) => {
+app.get("/allGtt", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const gtts = await GttModel.find({ userId }).sort({ createdAt: -1 });
@@ -1856,7 +1938,7 @@ app.get("/allGtt", async (req, res) => {
   }
 });
 
-app.post("/newGtt", async (req, res) => {
+app.post("/newGtt", requireAuth, async (req, res) => {
   try {
     const {
       userId = getAuthenticatedUserId(req),
@@ -1926,17 +2008,24 @@ app.post("/newGtt", async (req, res) => {
   }
 });
 
-app.post("/cancelGtt", async (req, res) => {
+app.post("/cancelGtt", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.body;
     if (!id) {
       return res.status(400).json({ success: false, message: "GTT ID required" });
     }
-    const updated = await GttModel.findByIdAndUpdate(
-      id,
+    const updated = await GttModel.findOneAndUpdate(
+      { _id: id, userId },
       { status: "CANCELLED" },
       { new: true }
     );
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "GTT order not found" });
+    }
     res.status(200).json({ success: true, message: "GTT order cancelled", gtt: updated });
   } catch (error) {
     console.error("Error cancelling GTT:", error);
@@ -1944,12 +2033,16 @@ app.post("/cancelGtt", async (req, res) => {
   }
 });
 
-app.post("/triggerGtt", async (req, res) => {
+app.post("/triggerGtt", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.body;
-    const gtt = await GttModel.findById(id);
+    const gtt = await GttModel.findOne({ _id: id, userId });
     if (!gtt || gtt.status !== "ACTIVE") {
-      return res.status(400).json({ success: false, message: "GTT not found or already triggered" });
+      return res.status(404).json({ success: false, message: "GTT not found or already triggered" });
     }
 
     // Place the order
@@ -2064,7 +2157,7 @@ app.get("/basketTemplates", (req, res) => {
   res.status(200).json(strategyBasketTemplates);
 });
 
-app.post("/addTemplateToBaskets", async (req, res) => {
+app.post("/addTemplateToBaskets", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -2109,41 +2202,13 @@ app.post("/addTemplateToBaskets", async (req, res) => {
   }
 });
 
-app.get("/allBaskets", async (req, res) => {
+app.get("/allBaskets", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(200).json([]);
     }
-    let baskets = await BasketModel.find({ userId }).sort({ createdAt: -1 });
-
-    // Auto-seed default baskets for user if empty so they have realistic dynamic constituents
-    if (baskets.length === 0) {
-      const defaultBaskets = [
-        {
-          userId,
-          name: "Nifty Bull Spread",
-          items: [
-            { symbol: "INFY", mode: "BUY", product: "CNC", qty: 10, price: 1845.5, orderType: "LIMIT" },
-            { symbol: "TCS", mode: "BUY", product: "CNC", qty: 5, price: 3982.75, orderType: "LIMIT" },
-          ],
-          marginRequired: 38368.75,
-        },
-        {
-          userId,
-          name: "IT Long Term SIP",
-          items: [
-            { symbol: "INFY", mode: "BUY", product: "CNC", qty: 5, price: 1845.5, orderType: "LIMIT" },
-            { symbol: "WIPRO", mode: "BUY", product: "CNC", qty: 15, price: 546.8, orderType: "LIMIT" },
-            { symbol: "TCS", mode: "BUY", product: "CNC", qty: 2, price: 3982.75, orderType: "LIMIT" },
-          ],
-          marginRequired: 25395.0,
-        },
-      ];
-      baskets = await BasketModel.insertMany(defaultBaskets);
-      console.log(`📦 [BASKETS SEEDED] Initialized 2 real constituent baskets for user ${userId}`);
-    }
-
+    const baskets = await BasketModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(baskets);
   } catch (error) {
     console.error("Error fetching baskets:", error);
@@ -2151,7 +2216,7 @@ app.get("/allBaskets", async (req, res) => {
   }
 });
 
-app.post("/saveBasket", async (req, res) => {
+app.post("/saveBasket", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const { id, name, items = [] } = req.body;
@@ -2195,10 +2260,17 @@ app.post("/saveBasket", async (req, res) => {
   }
 });
 
-app.delete("/deleteBasket/:id", async (req, res) => {
+app.delete("/deleteBasket/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    await BasketModel.findByIdAndDelete(id);
+    const deleted = await BasketModel.findOneAndDelete({ _id: id, userId });
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "Basket not found" });
+    }
     res.status(200).json({ success: true, message: "Basket deleted successfully" });
   } catch (error) {
     console.error("Error deleting basket:", error);
@@ -2206,7 +2278,7 @@ app.delete("/deleteBasket/:id", async (req, res) => {
   }
 });
 
-app.post("/executeBasket", async (req, res) => {
+app.post("/executeBasket", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const { items = [], basketName = "Basket" } = req.body;
@@ -2290,7 +2362,7 @@ app.post("/executeBasket", async (req, res) => {
 // ============================================================================
 
 // 1. Fetch user notifications with optional category filtering
-app.get("/notifications", async (req, res) => {
+app.get("/notifications", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const limit = parseInt(req.query.limit) || 50;
@@ -2317,7 +2389,7 @@ app.get("/notifications", async (req, res) => {
 });
 
 // 2. High-speed unread count aggregation
-app.get("/notifications/unreadCount", async (req, res) => {
+app.get("/notifications/unreadCount", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const unreadCount = await NotificationModel.countDocuments({ userId, unread: true });
@@ -2328,15 +2400,22 @@ app.get("/notifications/unreadCount", async (req, res) => {
   }
 });
 
-// 3. Mark single notification as read
-app.patch("/notifications/:id/read", async (req, res) => {
+// 3. Mark single notification as read (tenant-scoped)
+app.patch("/notifications/:id/read", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
     const { id } = req.params;
-    const updated = await NotificationModel.findByIdAndUpdate(
-      id,
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid notification ID" });
+    }
+    const updated = await NotificationModel.findOneAndUpdate(
+      { _id: id, userId },
       { $set: { unread: false } },
       { new: true }
     );
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Notification not found" });
+    }
     res.status(200).json({ success: true, notification: updated });
   } catch (error) {
     console.error("Error marking notification read:", error);
@@ -2345,7 +2424,7 @@ app.patch("/notifications/:id/read", async (req, res) => {
 });
 
 // 4. Mark all notifications as read (Atomic bulk update)
-app.post("/notifications/markAllRead", async (req, res) => {
+app.post("/notifications/markAllRead", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     await NotificationModel.updateMany({ userId, unread: true }, { $set: { unread: false } });
@@ -2356,11 +2435,18 @@ app.post("/notifications/markAllRead", async (req, res) => {
   }
 });
 
-// 5. Delete single notification
-app.delete("/notifications/:id", async (req, res) => {
+// 5. Delete single notification (tenant-scoped)
+app.delete("/notifications/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
     const { id } = req.params;
-    await NotificationModel.findByIdAndDelete(id);
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: "Invalid notification ID" });
+    }
+    const deleted = await NotificationModel.findOneAndDelete({ _id: id, userId });
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "Notification not found" });
+    }
     res.status(200).json({ success: true, message: "Notification deleted." });
   } catch (error) {
     console.error("Error deleting notification:", error);
@@ -2369,7 +2455,7 @@ app.delete("/notifications/:id", async (req, res) => {
 });
 
 // 6. Clear all notifications
-app.post("/notifications/clearAll", async (req, res) => {
+app.post("/notifications/clearAll", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     await NotificationModel.deleteMany({ userId });
@@ -2380,47 +2466,692 @@ app.post("/notifications/clearAll", async (req, res) => {
   }
 });
 
-// 7. Dynamic Funds deposit endpoint with automatic ledger & notification synchronization
-app.post("/addFunds", async (req, res) => {
+// ============================================================================
+// FUNDS TREASURY & INTERACTIVE UPI EMAIL COLLECT ENGINE
+// ============================================================================
+
+// 1. Initiate Fund Deposit (Dispatches Interactive UPI Collect Email)
+app.post("/fundDeposit/initiate", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
-    const { amount = 10000, method = "UPI" } = req.body;
-    let funds = await getOrCreateUserFunds(userId);
-    const numAmount = parseFloat(amount);
-    let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
-    currentAvailable += numAmount;
-    funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-    funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-    await funds.save();
+    const { amount, upiId } = req.body;
+    const validation = validatePositiveAmount(amount, { min: 1, max: 100000000 });
+    if (!validation.valid) {
+      return res.status(400).json({ success: false, message: validation.message });
+    }
+    const numAmount = validation.amount;
 
-    const refId = "UPI" + Math.floor(10000000000 + Math.random() * 90000000000);
-    await createNotification({
+    const cleanUpi = typeof upiId === "string" ? upiId.trim() : "";
+    if (!cleanUpi || !/^[\w.\-]{2,256}@[a-zA-Z]{2,64}$/.test(cleanUpi)) {
+      return res.status(400).json({ success: false, message: "Please provide a valid UPI ID (e.g. yourname@okhdfcbank)." });
+    }
+
+    const user = await UserModel.findOne({ userId });
+    const userEmail = user?.email;
+    if (!userEmail) {
+      return res.status(400).json({ success: false, message: "Registered user email not found for this account." });
+    }
+
+    const idempotencyKey =
+      typeof req.body.idempotencyKey === "string" && req.body.idempotencyKey.trim()
+        ? req.body.idempotencyKey.trim()
+        : typeof req.headers["idempotency-key"] === "string" && req.headers["idempotency-key"].trim()
+        ? req.headers["idempotency-key"].trim()
+        : undefined;
+
+    if (idempotencyKey) {
+      const existingTx = await FundsTransactionModel.findOne({ userId, idempotencyKey });
+      if (existingTx) {
+        const safeExisting = existingTx.toObject();
+        delete safeExisting.approvalToken;
+        return res.status(200).json({
+          success: true,
+          message: "Existing deposit request retrieved (idempotent replay).",
+          transaction: safeExisting,
+        });
+      }
+    }
+
+    const approvalToken = crypto.randomBytes(32).toString("hex");
+    const approvalExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const referenceId = "UPI" + crypto.randomInt(10000000000, 99999999999);
+
+    const newTx = new FundsTransactionModel({
       userId,
-      type: "FUNDS",
-      category: "MARGIN",
-      title: "Funds Credited",
-      description: `₹${formatIndianCurrency(numAmount)} added via ${method} (Ref: ${refId}). Margin updated.`,
-      metadata: {
-        amount: numAmount,
-        referenceId: refId,
-        actionUrl: "/funds",
-      },
+      type: "PAYIN",
+      amount: numAmount,
+      paymentMethod: "UPI",
+      upiId: cleanUpi,
+      status: "PENDING_APPROVAL",
+      referenceId,
+      approvalToken,
+      approvalExpiresAt,
+      idempotencyKey,
+      remarks: `Instant UPI Payin via ${cleanUpi}`,
     });
+    await newTx.save();
+
+    const approveUrl = `${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${approvalToken}&decision=APPROVE`;
+    const declineUrl = `${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${approvalToken}&decision=REJECT`;
+
+    await sendFundDepositEmail({
+      toEmail: userEmail,
+      amount: numAmount,
+      upiId: cleanUpi,
+      referenceId,
+      approveUrl,
+      declineUrl,
+    });
+
+    try {
+      await createNotification({
+        userId,
+        type: "FUNDS",
+        category: "MARGIN",
+        title: "UPI Payin Initiated",
+        description: `UPI collect request for ₹${formatIndianCurrency(numAmount)} sent to ${cleanUpi}. Please approve via email. Ref: ${referenceId}.`,
+        metadata: {
+          amount: numAmount,
+          referenceId,
+          actionUrl: "/funds",
+        },
+      });
+    } catch (e) {}
+
+    const safeTx = newTx.toObject();
+    delete safeTx.approvalToken;
+
+    res.status(201).json({
+      success: true,
+      message: `UPI Collect Request sent to ${cleanUpi}! Please approve the payment via the authorization email sent to ${userEmail}.`,
+      transaction: safeTx,
+    });
+  } catch (error) {
+    logger.error("fund_deposit_initiate_error", { error: error.message });
+    res.status(500).json({ success: false, message: "Failed to initiate fund deposit." });
+  }
+});
+
+// 2a. Confirmation GET page (does not mutate state on GET pre-fetch / link scan)
+app.get("/fundDeposit/action", async (req, res) => {
+  try {
+    const token = typeof req.query.token === "string" ? req.query.token.trim() : "";
+    const decision = typeof req.query.decision === "string" ? req.query.decision.trim().toUpperCase() : "";
+    if (!token || !["APPROVE", "REJECT"].includes(decision)) {
+      return res.status(400).send("<h3>Invalid or missing deposit action parameters.</h3>");
+    }
+
+    const tx = await FundsTransactionModel.findOne({ approvalToken: token });
+    if (!tx || (tx.approvalExpiresAt && new Date(tx.approvalExpiresAt) < new Date())) {
+      return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Request Expired</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Link Expired or Invalid</h2><p>We could not find an active deposit request for this token.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">Return to Zerodha Kite</a></body></html>`);
+    }
+
+    if (tx.status !== "PENDING_APPROVAL") {
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Already Processed</h2><p>Deposit request <strong>${escapeHtml(tx.referenceId)}</strong> has already been marked as <strong>${escapeHtml(tx.status)}</strong>.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">View in Zerodha Kite</a></body></html>`);
+    }
+
+    return res.send(
+      renderConfirmationPage({
+        title: decision === "APPROVE" ? "Confirm UPI Fund Deposit" : "Decline UPI Fund Deposit",
+        subtitle: "Please confirm your deposit authorization decision below to proceed.",
+        actionUrl: `${PUBLIC_BACKEND_URL}/fundDeposit/action`,
+        token,
+        decision,
+        details: [
+          ["Amount", `₹${formatIndianCurrency(tx.amount)}`],
+          ["Reference ID", tx.referenceId],
+          ["Payer UPI ID", tx.upiId],
+        ],
+        returnUrl: `${PUBLIC_FRONTEND_URL}/funds`,
+      })
+    );
+  } catch (error) {
+    logger.error("fund_deposit_get_action_error", { error: error.message });
+    res.status(500).send("<h3>Server error validating deposit authorization.</h3>");
+  }
+});
+
+// 2b. Atomic state-changing POST endpoint for deposit approval / rejection
+app.post("/fundDeposit/action", authLimiter, async (req, res) => {
+  try {
+    const token = typeof req.body.token === "string" ? req.body.token.trim() : "";
+    const decision = typeof req.body.decision === "string" ? req.body.decision.trim().toUpperCase() : "";
+    if (!token || !["APPROVE", "REJECT"].includes(decision)) {
+      return res.status(400).send("<h3>Invalid or missing deposit action parameters.</h3>");
+    }
+
+    const now = new Date();
+    const isApprove = decision === "APPROVE";
+
+    const outcome = await runInTransaction(async (session) => {
+      const sOpt = session ? { session } : undefined;
+      const tx = await FundsTransactionModel.findOneAndUpdate(
+        {
+          approvalToken: token,
+          status: "PENDING_APPROVAL",
+          $or: [{ approvalExpiresAt: { $gt: now } }, { approvalExpiresAt: null }, { approvalExpiresAt: { $exists: false } }],
+        },
+        {
+          $set: {
+            status: isApprove ? "COMPLETED" : "REJECTED",
+            completedAt: now,
+            approvalToken: null,
+          },
+        },
+        { new: true, ...(sOpt || {}) }
+      );
+
+      if (!tx) {
+        return { found: false };
+      }
+
+      if (isApprove) {
+        const funds = await getOrCreateUserFunds(tx.userId, session);
+        const amountPaise = toPaise(tx.amount);
+        const newAvailPaise = addPaise(toPaise(funds.equity.availableMargin), amountPaise);
+        const newPayinPaise = addPaise(toPaise(funds.equity.payin || "0"), amountPaise);
+
+        funds.equity.availableMargin = formatPaiseINR(newAvailPaise);
+        funds.equity.availableCash = formatPaiseINR(newAvailPaise);
+        funds.equity.payin = formatPaiseINR(newPayinPaise);
+        await funds.save(sOpt);
+      }
+
+      return { found: true, tx };
+    });
+
+    if (!outcome.found) {
+      return res.status(409).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Request Invalid or Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Deposit Request Invalid, Expired, or Already Processed</h2><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">View in Zerodha Kite</a></body></html>`);
+    }
+
+    const { tx } = outcome;
+    try {
+      await createNotification({
+        userId: tx.userId,
+        type: "FUNDS",
+        category: "MARGIN",
+        title: isApprove ? "Funds Credited Successfully" : "UPI Transfer Declined",
+        description: isApprove
+          ? `₹${formatIndianCurrency(tx.amount)} credited to your trading account via UPI (${tx.upiId}). Margin available immediately. Ref: ${tx.referenceId}.`
+          : `UPI deposit request of ₹${formatIndianCurrency(tx.amount)} was declined. Ref: ${tx.referenceId}.`,
+        metadata: { amount: tx.amount, referenceId: tx.referenceId, actionUrl: "/funds" },
+      });
+    } catch (e) {}
+
+    logger.info("fund_deposit_processed", { userId: tx.userId, status: tx.status, referenceId: tx.referenceId });
+
+    if (isApprove) {
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Approved - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#16a34a;">Funds Credited Successfully!</h2><p>Amount: <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong></p><p>Ref: <code>${escapeHtml(tx.referenceId)}</code> &bull; UPI: ${escapeHtml(tx.upiId)}</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds" style="display:inline-block;background:#16a34a;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;">View in Zerodha Kite Dashboard</a></div></body></html>`);
+    }
+    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Transfer Declined - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#dc2626;">UPI Transfer Declined</h2><p>Declined request for <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong>. No funds transferred.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">Return to Dashboard</a></div></body></html>`);
+  } catch (error) {
+    logger.error("fund_deposit_post_action_error", { error: error.message });
+    res.status(500).send("<h3>Server error processing deposit authorization.</h3>");
+  }
+});
+
+// 3. Fetch User's Funds Transaction Ledger
+app.get("/fundsTransactions", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) return res.status(200).json([]);
+    const transactions = await FundsTransactionModel.find({ userId }).sort({ createdAt: -1 });
+    res.status(200).json(transactions);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch funds transactions" });
+  }
+});
+
+// ============================================================================
+// DYNAMIC LINKED BANK ACCOUNTS (SEBI PENNY-DROP VERIFIED)
+// ============================================================================
+
+// 1. Get User's Linked Bank Accounts
+app.get("/userBankAccounts", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) return res.status(200).json([]);
+
+    const accounts = await BankAccountModel.find({ userId }).sort({ isPrimary: -1, createdAt: 1 });
+    res.status(200).json(accounts);
+  } catch (error) {
+    console.error("Error fetching bank accounts:", error);
+    res.status(500).json({ error: "Failed to fetch bank accounts" });
+  }
+});
+
+// 2. Add New Bank Account (Dynamic Linking & Penny Drop Simulation)
+app.post("/addBankAccount", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+
+    const { bankName, accountNumber, ifscCode, accountType = "SAVINGS", branch = "Main Branch", isPrimary = false } = req.body;
+
+    if (!bankName || !accountNumber || !ifscCode) {
+      return res.status(400).json({ success: false, message: "Bank name, account number, and IFSC code are required." });
+    }
+
+    const cleanAcc = accountNumber.toString().trim();
+    if (cleanAcc.length < 8) {
+      return res.status(400).json({ success: false, message: "Please provide a valid bank account number (min 8 digits)." });
+    }
+
+    const cleanIfsc = ifscCode.toString().trim().toUpperCase();
+    const ifscRegex = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+    if (!ifscRegex.test(cleanIfsc)) {
+      return res.status(400).json({ success: false, message: "Invalid IFSC Code format. E.g. HDFC0000060 or SBIN0001234." });
+    }
+
+    const masked = "····" + cleanAcc.slice(-4);
+    const existingCount = await BankAccountModel.countDocuments({ userId });
+    const shouldBePrimary = isPrimary || existingCount === 0;
+
+    // If setting as primary, unset any existing primary
+    if (shouldBePrimary) {
+      await BankAccountModel.updateMany({ userId }, { $set: { isPrimary: false } });
+    }
+
+    const pennyDropRef = "PD" + crypto.randomInt(100000000, 1000000000);
+
+    const newAccount = new BankAccountModel({
+      userId,
+      bankName: bankName.trim(),
+      accountNumber: cleanAcc,
+      maskedAccountNumber: masked,
+      ifscCode: cleanIfsc,
+      branch: branch.trim(),
+      accountType: accountType.toUpperCase() === "CURRENT" ? "CURRENT" : "SAVINGS",
+      isPrimary: shouldBePrimary,
+      status: "VERIFIED",
+      pennyDropRef,
+    });
+    await newAccount.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "COMPLIANCE",
+        category: "BANK_ACCOUNT",
+        title: "Bank Account Linked Successfully",
+        description: `${bankName.trim()} A/C (${masked}) successfully verified via NPCI Penny Drop and linked to your Zerodha trading account.`,
+        metadata: {
+          accountNumber: masked,
+          actionUrl: "/funds",
+        },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `${bankName.trim()} A/C (${masked}) linked and verified successfully!`,
+      account: newAccount,
+    });
+  } catch (error) {
+    console.error("Error adding bank account:", error);
+    res.status(500).json({ success: false, message: "Failed to link bank account." });
+  }
+});
+
+// 3. Set Primary Bank Account
+app.put("/setPrimaryBankAccount/:id", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const { id } = req.params;
+
+    await BankAccountModel.updateMany({ userId }, { $set: { isPrimary: false } });
+    const account = await BankAccountModel.findOneAndUpdate(
+      { _id: id, userId },
+      { $set: { isPrimary: true } },
+      { new: true }
+    );
+
+    if (!account) {
+      return res.status(404).json({ success: false, message: "Bank account not found." });
+    }
 
     res.status(200).json({
       success: true,
-      message: `₹${formatIndianCurrency(numAmount)} deposited successfully.`,
-      funds: funds.equity,
+      message: `${account.bankName} (${account.maskedAccountNumber}) is now your Primary bank account for withdrawals.`,
+      account,
     });
-  } catch (err) {
-    console.error("Add funds error:", err);
-    res.status(500).json({ success: false, message: "Failed to add funds" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to update primary bank account." });
+  }
+});
+
+// 4. Delete Bank Account
+app.delete("/deleteBankAccount/:id", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const { id } = req.params;
+
+    const account = await BankAccountModel.findOne({ _id: id, userId });
+    if (!account) {
+      return res.status(404).json({ success: false, message: "Bank account not found." });
+    }
+
+    if (account.isPrimary) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot delete your Primary bank account. Please set another account as primary first.",
+      });
+    }
+
+    await BankAccountModel.deleteOne({ _id: id, userId });
+    res.status(200).json({ success: true, message: "Bank account unlinked successfully." });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to delete bank account." });
+  }
+});
+
+// Per-user in-flight lock to prevent concurrent withdrawal race conditions (TOCTOU)
+
+// 4. Withdraw Funds Endpoint (SEBI Clearance Cycle + ACID Transaction + Paise Math)
+app.post("/withdrawFunds", requireAuth, tradeFundsLimiter, async (req, res) => {
+  const userId = getAuthenticatedUserId(req);
+  try {
+    const { amount, bankAccount = "HDFC Bank ····4821", upiId } = req.body;
+    const validation = validatePositiveAmount(amount, { min: 1, max: 100000000 });
+    if (!validation.valid) {
+      return res.status(400).json({ success: false, message: validation.message });
+    }
+    const { amount: numAmount, paise: reqPaise } = validation;
+
+    const txResult = await withUserLock(`funds:${userId}`, async () =>
+      runInTransaction(async (session) => {
+        const sOpt = session ? { session } : undefined;
+        const funds = await getOrCreateUserFunds(userId, session);
+        const previousCashStr = funds.equity.availableCash;
+        const currentAvailPaise = toPaise(funds.equity.availableMargin);
+        const currentCashPaise = toPaise(previousCashStr);
+        const currentPayoutPaise = toPaise(funds.equity.payout || "0");
+
+        if (reqPaise > currentCashPaise) {
+          return {
+            status: 400,
+            payload: {
+              success: false,
+              message: `Insufficient withdrawable cash balance! You can withdraw up to ₹${formatPaiseINR(currentCashPaise)}.`,
+            },
+          };
+        }
+
+        const updatedFunds = await FundsModel.findOneAndUpdate(
+          { _id: funds._id, "equity.availableCash": previousCashStr },
+          {
+            $set: {
+              "equity.availableMargin": formatPaiseINR(subPaise(currentAvailPaise, reqPaise)),
+              "equity.availableCash": formatPaiseINR(subPaise(currentCashPaise, reqPaise)),
+              "equity.payout": formatPaiseINR(addPaise(currentPayoutPaise, reqPaise)),
+            },
+          },
+          { new: true, ...(sOpt || {}) }
+        );
+        if (!updatedFunds) {
+          return {
+            status: 409,
+            payload: { success: false, message: "Balance changed concurrently. Please retry withdrawal." },
+          };
+        }
+
+        const referenceId = "PAYOUT" + crypto.randomInt(10000000000, 99999999999);
+        const newTx = new FundsTransactionModel({
+          userId,
+          type: "PAYOUT",
+          amount: numAmount,
+          paymentMethod: upiId ? "UPI" : "NEFT/RTGS",
+          upiId: upiId || null,
+          bankAccount,
+          status: "COMPLETED",
+          referenceId,
+          remarks: `Withdrawal to ${bankAccount}`,
+          completedAt: new Date(),
+        });
+        await newTx.save(sOpt);
+
+        return { status: 200, funds: updatedFunds.equity, newTx, referenceId };
+      })
+    );
+
+    if (txResult.status !== 200) {
+      return res.status(txResult.status).json(txResult.payload);
+    }
+
+    try {
+      await createNotification({
+        userId,
+        type: "FUNDS",
+        category: "MARGIN",
+        title: "Funds Withdrawal Requested",
+        description: `Withdrawal request for ₹${formatIndianCurrency(numAmount)} submitted. Crediting to ${bankAccount} by 06:00 IST tomorrow. Ref: ${txResult.referenceId}.`,
+        metadata: { amount: numAmount, referenceId: txResult.referenceId, actionUrl: "/funds" },
+      });
+    } catch (e) {}
+
+    return res.status(200).json({
+      success: true,
+      message: `₹${formatIndianCurrency(numAmount)} withdrawal processed! Funds will be credited to ${bankAccount}.`,
+      funds: txResult.funds,
+      transaction: txResult.newTx,
+    });
+  } catch (error) {
+    if (error?.status === 429) {
+      return res.status(429).json({ success: false, message: error.message });
+    }
+    logger.error("withdraw_funds_error", { error: error.message });
+    return res.status(500).json({ success: false, message: "Failed to process withdrawal request." });
+  }
+});
+
+// 5. Margin Pledging: Pledge Demat Holdings for Trading Collateral
+app.post("/pledgeHolding", requireAuth, tradeFundsLimiter, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const { symbol, companyName, quantity, marketPrice } = req.body;
+    if (!symbol || typeof symbol !== "string") {
+      return res.status(400).json({ success: false, message: "Valid stock symbol is required." });
+    }
+    const numQty = parseInt(quantity, 10);
+    const priceValidation = validatePositiveAmount(marketPrice || 100, { min: 0.01, max: 10000000 });
+    if (!Number.isInteger(numQty) || numQty <= 0 || !priceValidation.valid) {
+      return res.status(400).json({ success: false, message: "Valid positive quantity and market price are required." });
+    }
+    const numPrice = priceValidation.amount;
+
+    const sym = symbol.trim().toUpperCase();
+    let haircutPercent = 20;
+    if (sym === "RELIANCE" || sym === "TCS") haircutPercent = 12.5;
+    else if (sym === "INFY" || sym === "HDFCBANK" || sym === "ICICIBANK") haircutPercent = 15;
+
+    const txResult = await withUserLock(`funds:${userId}`, async () =>
+      runInTransaction(async (session) => {
+        const sOpt = session ? { session } : undefined;
+        const holdingQuery = HoldingsModel.findOne({ userId, $or: [{ name: symbol }, { instrument: symbol }] });
+        if (session) holdingQuery.session(session);
+        const holding = await holdingQuery;
+
+        const ownedQty = holding ? holding.qty : 0;
+        if (ownedQty < numQty) {
+          return {
+            status: 400,
+            payload: {
+              success: false,
+              message: `Insufficient Demat shares! You hold ${ownedQty} shares of ${symbol}, but attempted to pledge ${numQty} shares.`,
+            },
+          };
+        }
+
+        const totalValPaise = Math.round(numQty * toPaise(numPrice));
+        const collateralPaise = Math.round(totalValPaise * (1 - haircutPercent / 100));
+        const collateralValue = fromPaise(collateralPaise);
+        const pledgeRef = "PLG" + crypto.randomInt(10000000000, 99999999999);
+
+        const newPledge = new PledgedCollateralModel({
+          userId,
+          symbol,
+          companyName: companyName || symbol,
+          pledgedQty: numQty,
+          marketPrice: numPrice,
+          haircutPercent,
+          collateralValue,
+          status: "PLEDGED",
+          pledgeRef,
+        });
+        await newPledge.save(sOpt);
+
+        const funds = await getOrCreateUserFunds(userId, session);
+        funds.equity.availableMargin = formatPaiseINR(addPaise(toPaise(funds.equity.availableMargin), collateralPaise));
+        funds.equity.collateralEquity = formatPaiseINR(addPaise(toPaise(funds.equity.collateralEquity || "0"), collateralPaise));
+        funds.equity.totalCollateral = formatPaiseINR(addPaise(toPaise(funds.equity.totalCollateral || "0"), collateralPaise));
+        await funds.save(sOpt);
+
+        const newTx = new FundsTransactionModel({
+          userId,
+          type: "PLEDGE_MARGIN",
+          amount: collateralValue,
+          paymentMethod: "COLLATERAL",
+          status: "COMPLETED",
+          referenceId: pledgeRef,
+          remarks: `Pledged ${numQty} sh of ${symbol} (${haircutPercent}% haircut)`,
+          completedAt: new Date(),
+        });
+        await newTx.save(sOpt);
+
+        return { status: 201, newPledge, collateralValue, pledgeRef, equity: funds.equity };
+      })
+    );
+
+    if (txResult.status !== 201) {
+      return res.status(txResult.status).json(txResult.payload);
+    }
+
+    try {
+      await createNotification({
+        userId,
+        type: "FUNDS",
+        category: "MARGIN_PLEDGE",
+        title: `Margin Pledged - ${symbol}`,
+        description: `Pledged ${numQty} shares of ${symbol}. Generated ₹${formatIndianCurrency(txResult.collateralValue)} trading collateral (Haircut: ${haircutPercent}%). Ref: ${txResult.pledgeRef}.`,
+        metadata: { symbol, amount: txResult.collateralValue, actionUrl: "/funds" },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `Successfully pledged ${numQty} shares of ${symbol}! ₹${formatIndianCurrency(txResult.collateralValue)} added to available margin.`,
+      pledge: txResult.newPledge,
+      collateralValue: txResult.collateralValue,
+      funds: txResult.equity,
+    });
+  } catch (error) {
+    if (error?.status === 429) {
+      return res.status(429).json({ success: false, message: error.message });
+    }
+    logger.error("pledge_holding_error", { error: error.message });
+    res.status(500).json({ success: false, message: "Failed to pledge shares for margin." });
+  }
+});
+
+// 6. Unpledge Holding
+app.post("/unpledgeHolding", requireAuth, tradeFundsLimiter, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const { pledgeId } = req.body;
+    if (!mongoose.Types.ObjectId.isValid(pledgeId)) {
+      return res.status(400).json({ success: false, message: "Valid pledgeId is required." });
+    }
+
+    const txResult = await withUserLock(`funds:${userId}`, async () =>
+      runInTransaction(async (session) => {
+        const sOpt = session ? { session } : undefined;
+        const pledgeQuery = PledgedCollateralModel.findOne({ _id: pledgeId, userId, status: "PLEDGED" });
+        if (session) pledgeQuery.session(session);
+        const pledge = await pledgeQuery;
+        if (!pledge) {
+          return { status: 404, payload: { success: false, message: "Active pledged record not found." } };
+        }
+
+        const funds = await getOrCreateUserFunds(userId, session);
+        const availPaise = toPaise(funds.equity.availableMargin);
+        const colEqPaise = toPaise(funds.equity.collateralEquity || "0");
+        const colTotPaise = toPaise(funds.equity.totalCollateral || "0");
+        const releasePaise = toPaise(pledge.collateralValue);
+
+        if (availPaise < releasePaise) {
+          return {
+            status: 400,
+            payload: {
+              success: false,
+              message: `Cannot unpledge! You have open positions utilizing this collateral. Free up at least ₹${formatPaiseINR(releasePaise)} margin before unpledging.`,
+            },
+          };
+        }
+
+        pledge.status = "RELEASED";
+        pledge.releasedAt = new Date();
+        await pledge.save(sOpt);
+
+        funds.equity.availableMargin = formatPaiseINR(subPaise(availPaise, releasePaise));
+        funds.equity.collateralEquity = formatPaiseINR(Math.max(0, subPaise(colEqPaise, releasePaise)));
+        funds.equity.totalCollateral = formatPaiseINR(Math.max(0, subPaise(colTotPaise, releasePaise)));
+        await funds.save(sOpt);
+
+        const unpledgeRef = "UNPLG" + crypto.randomInt(10000000000, 99999999999);
+        const newTx = new FundsTransactionModel({
+          userId,
+          type: "UNPLEDGE_MARGIN",
+          amount: pledge.collateralValue,
+          paymentMethod: "COLLATERAL",
+          status: "COMPLETED",
+          referenceId: unpledgeRef,
+          remarks: `Unpledged ${pledge.pledgedQty} sh of ${pledge.symbol}`,
+          completedAt: new Date(),
+        });
+        await newTx.save(sOpt);
+
+        return { status: 200, pledge, equity: funds.equity };
+      })
+    );
+
+    if (txResult.status !== 200) {
+      return res.status(txResult.status).json(txResult.payload);
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Successfully unpledged ${txResult.pledge.pledgedQty} shares of ${txResult.pledge.symbol}! Demat lock released.`,
+      funds: txResult.equity,
+    });
+  } catch (error) {
+    if (error?.status === 429) {
+      return res.status(429).json({ success: false, message: error.message });
+    }
+    logger.error("unpledge_holding_error", { error: error.message });
+    res.status(500).json({ success: false, message: "Failed to unpledge shares." });
+  }
+});
+
+// 7. Get User's Pledged Holdings
+app.get("/myPledgedHoldings", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) return res.status(200).json([]);
+    const pledges = await PledgedCollateralModel.find({ userId, status: "PLEDGED" }).sort({ pledgedAt: -1 });
+    res.status(200).json(pledges);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch pledged holdings" });
   }
 });
 
 // 8. Test notification trigger (for rapid dev testing / simulation)
-app.post("/notifications/test", async (req, res) => {
+app.post("/notifications/test", requireAuth, async (req, res) => {
   try {
+    if (IS_PROD) {
+      return res.status(403).json({ success: false, message: "Test endpoint is disabled in production." });
+    }
     const userId = getAuthenticatedUserId(req);
     const { type = "ORDER", title, description, metadata } = req.body;
     const notification = await createNotification({
@@ -2443,9 +3174,9 @@ app.post("/notifications/test", async (req, res) => {
 // ============================================================================
 
 // 1. Submit IPO Application & Dispatch Live Email UPI Mandate
-app.post("/applyIpo", async (req, res) => {
+app.post("/applyIpo", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(400).json({ success: false, message: "userId is required to apply for IPO" });
     }
@@ -2511,16 +3242,17 @@ app.post("/applyIpo", async (req, res) => {
       });
     }
 
-    // Resolve user email
-    let targetEmail = userEmail;
+    // Resolve registered user email strictly from DB (prevent client email override)
+    const userDoc = await UserModel.findOne({ userId });
+    const targetEmail = userDoc?.email;
     if (!targetEmail) {
-      const userDoc = await UserModel.findOne({ userId });
-      targetEmail = userDoc?.email || process.env.EMAIL_USER || "trader@example.com";
+      return res.status(400).json({ success: false, message: "Registered user email not found for this account." });
     }
 
-    const randomSuffix = Math.floor(10000 + Math.random() * 90000);
+    const randomSuffix = crypto.randomInt(10000, 100000);
     const applicationNumber = `IPO-${new Date().getFullYear()}-${ipoSymbol.toUpperCase()}-${randomSuffix}`;
     const mandateToken = crypto.randomBytes(24).toString("hex");
+    const mandateExpiresAt = new Date(Date.now() + 48 * 60 * 60 * 1000);
 
     const newApplication = new IpoApplicationModel({
       userId,
@@ -2539,6 +3271,7 @@ app.post("/applyIpo", async (req, res) => {
       dematBoId,
       pan: pan.toUpperCase(),
       mandateToken,
+      mandateExpiresAt,
       status: "MANDATE_PENDING",
       mandateStatus: "PENDING_APPROVAL",
       appliedAt: new Date(),
@@ -2546,8 +3279,8 @@ app.post("/applyIpo", async (req, res) => {
 
     const savedApp = await newApplication.save();
 
-    const approveUrl = `http://localhost:3002/ipoMandate/action?token=${mandateToken}&decision=APPROVE`;
-    const declineUrl = `http://localhost:3002/ipoMandate/action?token=${mandateToken}&decision=REJECT`;
+    const approveUrl = `${PUBLIC_BACKEND_URL}/ipoMandate/action?token=${mandateToken}&decision=APPROVE`;
+    const declineUrl = `${PUBLIC_BACKEND_URL}/ipoMandate/action?token=${mandateToken}&decision=REJECT`;
 
     // Send real interactive email
     await sendIpoMandateEmail({
@@ -2584,10 +3317,13 @@ app.post("/applyIpo", async (req, res) => {
 
     console.log(`📋 [IPO APPLIED] ${userId} applied for ${companyName} (${numLots} lot) - Mandate sent to ${targetEmail}`);
 
+    const safeApp = savedApp.toObject();
+    delete safeApp.mandateToken;
+
     res.status(201).json({
       success: true,
       message: `IPO application submitted! UPI Mandate authorization email sent to ${targetEmail}.`,
-      application: savedApp,
+      application: safeApp,
     });
   } catch (error) {
     console.error("Error applying for IPO:", error);
@@ -2596,7 +3332,7 @@ app.post("/applyIpo", async (req, res) => {
 });
 
 // 2. Fetch User's Submitted IPO Applications
-app.get("/myIpoApplications", async (req, res) => {
+app.get("/myIpoApplications", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const applications = await IpoApplicationModel.find({ userId }).sort({ appliedAt: -1 });
@@ -2607,164 +3343,117 @@ app.get("/myIpoApplications", async (req, res) => {
   }
 });
 
-// 3. One-Click Email Action Endpoint (Approve / Decline from Gmail)
+// 3a. Confirmation GET page (prevents CSRF / GET pre-fetcher from mutating IPO mandate)
 app.get("/ipoMandate/action", async (req, res) => {
   try {
-    const { token, decision } = req.query;
-    if (!token || !decision) {
+    const token = typeof req.query.token === "string" ? req.query.token.trim() : "";
+    const decision = typeof req.query.decision === "string" ? req.query.decision.trim().toUpperCase() : "";
+    if (!token || !["APPROVE", "REJECT"].includes(decision)) {
       return res.status(400).send("<h3>Invalid or missing mandate action parameters.</h3>");
     }
 
     const application = await IpoApplicationModel.findOne({ mandateToken: token });
-    if (!application) {
-      return res.status(404).send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Mandate Expired</title><style>body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px; background: #f8fafc; color: #1e293b; }</style></head>
-        <body>
-          <h2 style="color: #ef4444;">Mandate Link Invalid or Expired</h2>
-          <p>We could not find an active IPO mandate associated with this authorization link.</p>
-          <a href="http://localhost:3001/bids" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">Return to Zerodha Kite</a>
-        </body>
-        </html>
-      `);
+    if (!application || (application.mandateExpiresAt && new Date(application.mandateExpiresAt) < new Date())) {
+      return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Expired</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2 style="color:#ef4444;">Mandate Link Invalid or Expired</h2><p>We could not find an active IPO mandate for this authorization link.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">Return to Zerodha Kite</a></body></html>`);
     }
 
     if (application.mandateStatus !== "PENDING_APPROVAL") {
-      return res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head><title>Mandate Already Processed</title><style>body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px; background: #f8fafc; color: #1e293b; }</style></head>
-        <body>
-          <h2>Mandate Already Processed</h2>
-          <p>This mandate for <strong>${application.companyName}</strong> has already been marked as <strong>${application.mandateStatus}</strong>.</p>
-          <a href="http://localhost:3001/bids" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">View in Zerodha Kite</a>
-        </body>
-        </html>
-      `);
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Mandate Already Processed</h2><p>Mandate for <strong>${escapeHtml(application.companyName)}</strong> has already been marked as <strong>${escapeHtml(application.mandateStatus)}</strong>.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">View in Zerodha Kite</a></body></html>`);
     }
 
-    const isApprove = decision.toUpperCase() === "APPROVE";
-    if (isApprove) {
-      application.status = "APPLIED";
-      application.mandateStatus = "ACCEPTED";
-      application.mandateDecidedAt = new Date();
-      await application.save();
-
-      // Dispatch in-app notification
-      try {
-        await createNotification({
-          userId: application.userId,
-          type: "FUNDS",
-          category: "IPO",
-          title: `Mandate Approved - ${application.companyName}`,
-          description: `UPI Mandate for ${application.companyName} (${application.lots} Lot, ₹${application.totalAmount.toLocaleString("en-IN")}) has been approved. Funds lien marked under ASBA.`,
-          metadata: {
-            symbol: application.ipoSymbol,
-            amount: application.totalAmount,
-            actionUrl: "/bids",
-          },
-        });
-      } catch (e) {}
-
-      return res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="utf-8">
-          <title>UPI Mandate Approved - Zerodha Kite</title>
-          <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; }
-            .receipt-card { max-width: 500px; margin: 0 auto; background: #fff; padding: 36px 28px; border-radius: 8px; border: 1px solid #e2e8f0; box-shadow: 0 10px 25px rgba(0,0,0,0.06); }
-            .success-icon { width: 56px; height: 56px; line-height: 56px; border-radius: 50%; background: #dcfce7; color: #16a34a; font-size: 28px; margin: 0 auto 16px auto; }
-            h2 { margin: 0 0 8px 0; color: #15803d; font-size: 22px; }
-            p { color: #64748b; font-size: 14px; line-height: 1.5; margin: 0 0 24px 0; }
-            .details-table { width: 100%; border-collapse: collapse; margin-bottom: 24px; text-align: left; font-size: 13px; }
-            .details-table td { padding: 8px 12px; border-bottom: 1px solid #f1f5f9; }
-            .details-table td.label { color: #64748b; }
-            .details-table td.val { font-weight: 600; color: #0f172a; text-align: right; }
-            .btn-return { display: inline-block; background: #387ed1; color: #fff; text-decoration: none; padding: 12px 28px; border-radius: 4px; font-weight: 500; font-size: 14px; }
-            .btn-return:hover { background: #2b6cb0; }
-          </style>
-        </head>
-        <body>
-          <div class="receipt-card">
-            <div class="success-icon">✓</div>
-            <h2>UPI Mandate Approved!</h2>
-            <p>Your UPI ASBA block for <strong>${application.companyName}</strong> has been successfully authorized and registered with the exchange.</p>
-            <table class="details-table">
-              <tr><td class="label">Application No.</td><td class="val">${application.applicationNumber}</td></tr>
-              <tr><td class="label">Bid Quantity</td><td class="val">${application.lots} Lot (${application.totalQty} Shares)</td></tr>
-              <tr><td class="label">Amount Blocked</td><td class="val">₹${application.totalAmount.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</td></tr>
-              <tr><td class="label">UPI ID</td><td class="val">${application.upiId}</td></tr>
-              <tr><td class="label">Status</td><td class="val" style="color: #16a34a;">Lien Marked (Active)</td></tr>
-            </table>
-            <a href="http://localhost:3001/bids" class="btn-return">View in Zerodha Kite Dashboard &rsaquo;</a>
-          </div>
-        </body>
-        </html>
-      `);
-    } else {
-      application.status = "CANCELLED";
-      application.mandateStatus = "REJECTED";
-      application.mandateDecidedAt = new Date();
-      await application.save();
-
-      try {
-        await createNotification({
-          userId: application.userId,
-          type: "COMPLIANCE",
-          category: "IPO",
-          title: `Mandate Declined - ${application.companyName}`,
-          description: `UPI Mandate for ${application.companyName} was declined. Application #${application.applicationNumber} has been revoked.`,
-          metadata: {
-            symbol: application.ipoSymbol,
-            actionUrl: "/bids",
-          },
-        });
-      } catch (e) {}
-
-      return res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <meta charset="utf-8">
-          <title>Mandate Declined - Zerodha Kite</title>
-          <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; }
-            .receipt-card { max-width: 500px; margin: 0 auto; background: #fff; padding: 36px 28px; border-radius: 8px; border: 1px solid #e2e8f0; box-shadow: 0 10px 25px rgba(0,0,0,0.06); }
-            .decline-icon { width: 56px; height: 56px; line-height: 56px; border-radius: 50%; background: #fee2e2; color: #dc2626; font-size: 28px; margin: 0 auto 16px auto; }
-            h2 { margin: 0 0 8px 0; color: #dc2626; font-size: 22px; }
-            p { color: #64748b; font-size: 14px; line-height: 1.5; margin: 0 0 24px 0; }
-            .btn-return { display: inline-block; background: #64748b; color: #fff; text-decoration: none; padding: 12px 28px; border-radius: 4px; font-weight: 500; font-size: 14px; }
-          </style>
-        </head>
-        <body>
-          <div class="receipt-card">
-            <div class="decline-icon">✕</div>
-            <h2>UPI Mandate Declined</h2>
-            <p>You have declined the UPI mandate for <strong>${application.companyName}</strong>. No funds have been blocked and your application has been cancelled.</p>
-            <a href="http://localhost:3001/bids" class="btn-return">Return to Dashboard</a>
-          </div>
-        </body>
-        </html>
-      `);
-    }
+    return res.send(
+      renderConfirmationPage({
+        title: decision === "APPROVE" ? "Confirm IPO UPI Mandate" : "Decline IPO UPI Mandate",
+        subtitle: `Authorize or decline the ASBA block for ${application.companyName}.`,
+        actionUrl: `${PUBLIC_BACKEND_URL}/ipoMandate/action`,
+        token,
+        decision,
+        details: [
+          ["Application No.", application.applicationNumber],
+          ["Company", application.companyName],
+          ["Amount Blocked", `₹${formatIndianCurrency(application.totalAmount)}`],
+          ["UPI ID", application.upiId],
+        ],
+        returnUrl: `${PUBLIC_FRONTEND_URL}/bids`,
+      })
+    );
   } catch (error) {
-    console.error("Error processing mandate decision:", error);
+    logger.error("ipo_mandate_get_action_error", { error: error.message });
+    res.status(500).send("<h3>Internal server error validating mandate decision.</h3>");
+  }
+});
+
+// 3b. Atomic state-changing POST action for IPO mandate
+app.post("/ipoMandate/action", authLimiter, async (req, res) => {
+  try {
+    const token = typeof req.body.token === "string" ? req.body.token.trim() : "";
+    const decision = typeof req.body.decision === "string" ? req.body.decision.trim().toUpperCase() : "";
+    if (!token || !["APPROVE", "REJECT"].includes(decision)) {
+      return res.status(400).send("<h3>Invalid or missing mandate action parameters.</h3>");
+    }
+
+    const now = new Date();
+    const isApprove = decision === "APPROVE";
+    const application = await IpoApplicationModel.findOneAndUpdate(
+      {
+        mandateToken: token,
+        mandateStatus: "PENDING_APPROVAL",
+        $or: [{ mandateExpiresAt: { $gt: now } }, { mandateExpiresAt: null }, { mandateExpiresAt: { $exists: false } }],
+      },
+      {
+        $set: {
+          status: isApprove ? "APPLIED" : "CANCELLED",
+          mandateStatus: isApprove ? "ACCEPTED" : "REJECTED",
+          mandateDecidedAt: now,
+          mandateToken: null,
+        },
+      },
+      { new: true }
+    );
+
+    if (!application) {
+      return res.status(409).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Invalid or Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>IPO Mandate Invalid, Expired, or Already Processed</h2><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">View in Zerodha Kite</a></body></html>`);
+    }
+
+    try {
+      await createNotification({
+        userId: application.userId,
+        type: isApprove ? "FUNDS" : "COMPLIANCE",
+        category: "IPO",
+        title: isApprove ? `Mandate Approved - ${application.companyName}` : `Mandate Declined - ${application.companyName}`,
+        description: isApprove
+          ? `UPI Mandate for ${application.companyName} (${application.lots} Lot, ₹${formatIndianCurrency(application.totalAmount)}) has been approved. Funds lien marked under ASBA.`
+          : `UPI Mandate for ${application.companyName} was declined. Application #${application.applicationNumber} has been revoked.`,
+        metadata: { symbol: application.ipoSymbol, amount: application.totalAmount, actionUrl: "/bids" },
+      });
+    } catch (e) {}
+
+    if (isApprove) {
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>UPI Mandate Approved - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#15803d;">UPI Mandate Approved!</h2><p>ASBA block registered for <strong>${escapeHtml(application.companyName)}</strong>.</p><p>App No: <code>${escapeHtml(application.applicationNumber)}</code> &bull; Amount: ₹${escapeHtml(formatIndianCurrency(application.totalAmount))}</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids" style="display:inline-block;background:#387ed1;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;">View in Zerodha Kite Dashboard</a></div></body></html>`);
+    }
+    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Declined - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#dc2626;">UPI Mandate Declined</h2><p>You declined the mandate for <strong>${escapeHtml(application.companyName)}</strong>.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">Return to Dashboard</a></div></body></html>`);
+  } catch (error) {
+    logger.error("ipo_mandate_post_action_error", { error: error.message });
     res.status(500).send("<h3>Internal server error processing mandate decision.</h3>");
   }
 });
 
 // 4. Cancel / Revoke Submitted IPO Application
-app.delete("/cancelIpoApplication/:id", async (req, res) => {
+app.delete("/cancelIpoApplication/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const appDoc = await IpoApplicationModel.findByIdAndUpdate(
-      id,
+    const appDoc = await IpoApplicationModel.findOneAndUpdate(
+      { _id: id, userId },
       { status: "CANCELLED", mandateStatus: "REJECTED" },
       { new: true }
     );
+    if (!appDoc) {
+      return res.status(404).json({ success: false, message: "IPO application not found" });
+    }
     if (appDoc) {
       try {
         await createNotification({
@@ -2784,12 +3473,16 @@ app.delete("/cancelIpoApplication/:id", async (req, res) => {
 });
 
 // 5. Modify Existing IPO Bid (Lots / Price / Cut-off / UPI)
-app.put("/modifyIpoBid/:id", async (req, res) => {
+app.put("/modifyIpoBid/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
     const { lots, bidPrice, isCutOff, upiId } = req.body;
 
-    const appDoc = await IpoApplicationModel.findById(id);
+    const appDoc = await IpoApplicationModel.findOne({ _id: id, userId });
     if (!appDoc) {
       return res.status(404).json({ success: false, message: "IPO application not found." });
     }
@@ -2922,9 +3615,9 @@ app.get("/allGsecs", async (req, res) => {
   res.status(200).json(curatedGsecs);
 });
 
-app.post("/applyGsecBid", async (req, res) => {
+app.post("/applyGsecBid", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(401).json({ success: false, message: "User authentication required" });
     }
@@ -2933,7 +3626,7 @@ app.post("/applyGsecBid", async (req, res) => {
     const numPrice = parseFloat(pricePerUnit) || 1000;
     const totalAmount = numUnits * numPrice;
 
-    const bidNumber = `GSEC-${new Date().getFullYear()}-${symbol}-${Math.floor(10000 + Math.random() * 90000)}`;
+    const bidNumber = `GSEC-${new Date().getFullYear()}-${symbol}-${crypto.randomInt(10000, 100000)}`;
 
     const newBid = new GsecBidModel({
       userId,
@@ -2971,9 +3664,9 @@ app.post("/applyGsecBid", async (req, res) => {
   }
 });
 
-app.get("/myGsecApplications", async (req, res) => {
+app.get("/myGsecApplications", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) return res.status(200).json([]);
     const bids = await GsecBidModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(bids);
@@ -3029,9 +3722,9 @@ app.get("/allCorporateActions", async (req, res) => {
   res.status(200).json(curatedCorporateActions);
 });
 
-app.post("/tenderCorporateAction", async (req, res) => {
+app.post("/tenderCorporateAction", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(401).json({ success: false, message: "User authentication required" });
     }
@@ -3054,7 +3747,7 @@ app.post("/tenderCorporateAction", async (req, res) => {
       });
     }
 
-    const tenderRef = `CORP-${new Date().getFullYear()}-${symbol}-${Math.floor(10000 + Math.random() * 90000)}`;
+    const tenderRef = `CORP-${new Date().getFullYear()}-${symbol}-${crypto.randomInt(10000, 100000)}`;
 
     const newTender = new CorporateActionModel({
       userId,
@@ -3091,9 +3784,9 @@ app.post("/tenderCorporateAction", async (req, res) => {
   }
 });
 
-app.get("/myCorporateActionTenders", async (req, res) => {
+app.get("/myCorporateActionTenders", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) return res.status(200).json([]);
     const tenders = await CorporateActionModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(tenders);
@@ -3170,9 +3863,9 @@ app.get("/allAuctions", async (req, res) => {
   }
 });
 
-app.post("/submitAuctionOffer", async (req, res) => {
+app.post("/submitAuctionOffer", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(401).json({ success: false, message: "User authentication required" });
     }
@@ -3215,7 +3908,7 @@ app.post("/submitAuctionOffer", async (req, res) => {
     const totalAmount = numQty * numPrice;
     const premiumVal = ((numPrice - auction.basePrice) / auction.basePrice) * 100;
     const premiumPercent = `${premiumVal >= 0 ? "+" : ""}${premiumVal.toFixed(2)}%`;
-    const orderId = `AUC-${new Date().getFullYear()}-${symbol}-${Math.floor(10000 + Math.random() * 90000)}`;
+    const orderId = `AUC-${new Date().getFullYear()}-${symbol}-${crypto.randomInt(10000, 100000)}`;
 
     const newOffer = new AuctionOfferModel({
       userId,
@@ -3255,9 +3948,9 @@ app.post("/submitAuctionOffer", async (req, res) => {
   }
 });
 
-app.get("/myAuctionOffers", async (req, res) => {
+app.get("/myAuctionOffers", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) return res.status(200).json([]);
     const offers = await AuctionOfferModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(offers);
@@ -3350,9 +4043,9 @@ app.get("/allSseIpos", async (req, res) => {
   }
 });
 
-app.post("/applySseIpo", async (req, res) => {
+app.post("/applySseIpo", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(401).json({ success: false, message: "User authentication required" });
     }
@@ -3371,7 +4064,7 @@ app.post("/applySseIpo", async (req, res) => {
     }
 
     const taxCertificateNo = `80G-SSE-${symbol}-${Date.now().toString().slice(-6)}`;
-    const asbaReference = `ASBA-SSE-${Math.floor(100000 + Math.random() * 900000)}`;
+    const asbaReference = `ASBA-SSE-${crypto.randomInt(100000, 1000000)}`;
 
     const newApp = new SseApplicationModel({
       userId,
@@ -3412,9 +4105,9 @@ app.post("/applySseIpo", async (req, res) => {
   }
 });
 
-app.get("/mySseApplications", async (req, res) => {
+app.get("/mySseApplications", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) return res.status(200).json([]);
     const apps = await SseApplicationModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(apps);
@@ -3506,62 +4199,13 @@ app.get("/marketSipsCatalog", async (req, res) => {
 });
 
 // 1. Fetch all user SIPs (with default seeding from real market catalog if empty)
-app.get("/allSips", async (req, res) => {
+app.get("/allSips", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(200).json([]);
     }
-    let sips = await SipModel.find({ userId }).sort({ createdAt: -1 });
-
-    if (sips.length === 0) {
-      // Seed with top real market SIPs (e.g. Nifty BeES and Reliance)
-      const relianceMarket = marketSips50.find((m) => m.code === "SIP_RELIANCE");
-      const niftyBeesMarket = marketSips50.find((m) => m.code === "SIP_NIFTYBEES");
-
-      const seedSips = [];
-      if (relianceMarket) {
-        seedSips.push({
-          userId,
-          name: relianceMarket.name,
-          sipType: "STOCK",
-          symbol: "RELIANCE",
-          instruments: relianceMarket.instruments,
-          minAmount: relianceMarket.minAmount,
-          frequency: "MONTHLY",
-          scheduleDay: 5,
-          scheduleTime: "09:30",
-          status: "ACTIVE",
-          nextTriggerAt: calculateNextTriggerDate("MONTHLY", 5, "09:30"),
-          totalInstallmentsExecuted: 0,
-          totalCapitalInvested: 0,
-          executionLogs: [],
-        });
-      }
-      if (niftyBeesMarket) {
-        seedSips.push({
-          userId,
-          name: niftyBeesMarket.name,
-          sipType: "ETF",
-          symbol: "NIFTYBEES",
-          instruments: niftyBeesMarket.instruments,
-          minAmount: niftyBeesMarket.minAmount,
-          frequency: "WEEKLY",
-          scheduleDay: 1, // Monday
-          scheduleTime: "09:30",
-          status: "ACTIVE",
-          nextTriggerAt: calculateNextTriggerDate("WEEKLY", 1, "09:30"),
-          totalInstallmentsExecuted: 0,
-          totalCapitalInvested: 0,
-          executionLogs: [],
-        });
-      }
-
-      if (seedSips.length > 0) {
-        sips = await SipModel.insertMany(seedSips);
-      }
-    }
-
+    const sips = await SipModel.find({ userId }).sort({ createdAt: -1 });
     res.status(200).json(sips);
   } catch (error) {
     console.error("Error fetching SIPs:", error);
@@ -3570,9 +4214,9 @@ app.get("/allSips", async (req, res) => {
 });
 
 // 2. Create New Stock SIP (Supports 50 Real Market SIPs directly without a basket!)
-app.post("/createSip", async (req, res) => {
+app.post("/createSip", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(400).json({ success: false, message: "userId is required to create SIP" });
     }
@@ -3623,9 +4267,12 @@ app.post("/createSip", async (req, res) => {
         0
       );
     }
-    // Mode C: Legacy user basket
+    // Mode C: Legacy user basket (strictly tenant-scoped)
     else if (basketId) {
-      const basket = await BasketModel.findById(basketId);
+      if (!isValidObjectId(String(basketId))) {
+        return res.status(400).json({ success: false, message: "Invalid basket ID." });
+      }
+      const basket = await BasketModel.findOne({ _id: String(basketId).trim(), userId });
       if (!basket) {
         return res.status(404).json({ success: false, message: "Selected basket does not exist." });
       }
@@ -3692,10 +4339,14 @@ app.post("/createSip", async (req, res) => {
 });
 
 // 3. Toggle Status (Active / Paused)
-app.patch("/toggleSipStatus/:id", async (req, res) => {
+app.patch("/toggleSipStatus/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const sip = await SipModel.findById(id);
+    const sip = await SipModel.findOne({ _id: id, userId });
     if (!sip) return res.status(404).json({ success: false, message: "SIP not found" });
 
     sip.status = sip.status === "ACTIVE" ? "PAUSED" : "ACTIVE";
@@ -3722,14 +4373,18 @@ app.patch("/toggleSipStatus/:id", async (req, res) => {
 });
 
 // 3b. Rename SIP Endpoint
-app.patch("/updateSipName/:id", async (req, res) => {
+app.patch("/updateSipName/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
     const { name } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ success: false, message: "Valid SIP name is required." });
     }
-    const sip = await SipModel.findById(id);
+    const sip = await SipModel.findOne({ _id: id, userId });
     if (!sip) return res.status(404).json({ success: false, message: "SIP not found." });
 
     const oldName = sip.name;
@@ -3897,12 +4552,21 @@ async function executeSipInternal(sipId) {
 }
 
 // 5. Route to trigger SIP immediately (Option 1 - Interactive Pro Mode)
-app.post("/executeSipNow/:id", async (req, res) => {
+app.post("/executeSipNow/:id", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
+    const ownedSip = await SipModel.findOne({ _id: id, userId });
+    if (!ownedSip) {
+      return res.status(404).json({ success: false, message: "SIP not found" });
+    }
     const result = await executeSipInternal(id);
     if (!result.success) {
-      return res.status(400).json(result);
+      const status = result.code === "CDSL_AUTH_REQUIRED" ? 403 : 400;
+      return res.status(status).json(result);
     }
     return res.status(200).json(result);
   } catch (error) {
@@ -3912,30 +4576,39 @@ app.post("/executeSipNow/:id", async (req, res) => {
 });
 
 // 6. Delete SIP
-app.delete("/deleteSip/:id", async (req, res) => {
+app.delete("/deleteSip/:id", requireAuth, async (req, res) => {
   try {
-    const { id } = req.params;
-    const deleted = await SipModel.findByIdAndDelete(id);
-    if (deleted) {
-      try {
-        await createNotification({
-          userId: deleted.userId,
-          type: "ORDER",
-          category: "EXECUTION",
-          title: `SIP Deleted - ${deleted.name}`,
-          description: `Stock SIP "${deleted.name}" has been permanently cancelled.`,
-          metadata: { actionUrl: "/orders" },
-        });
-      } catch (e) {}
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
     }
+    const { id } = req.params;
+    const deleted = await SipModel.findOneAndDelete({ _id: id, userId });
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "SIP not found" });
+    }
+    try {
+      await createNotification({
+        userId: deleted.userId,
+        type: "ORDER",
+        category: "EXECUTION",
+        title: `SIP Deleted - ${deleted.name}`,
+        description: `Stock SIP "${deleted.name}" has been permanently cancelled.`,
+        metadata: { actionUrl: "/orders" },
+      });
+    } catch (e) {}
     res.status(200).json({ success: true, message: "SIP deleted successfully" });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to delete SIP" });
   }
 });
 
-// 7. Background Heartbeat Worker for SIPs (Runs every 45s)
-setInterval(async () => {
+// 7. Background Heartbeat Worker for SIPs (Runs every 45s with distributed lock)
+let sipWorkerInterval = null;
+async function runSipWorkerCycle() {
+  if (mongoose.connection.readyState !== 1) return;
+  const lockOwner = await acquireDistributedLock("sip-heartbeat-worker", 40000);
+  if (!lockOwner) return;
   try {
     const now = new Date();
     const dueSips = await SipModel.find({
@@ -3944,15 +4617,19 @@ setInterval(async () => {
     });
 
     for (const sip of dueSips) {
-      console.log(`⏰ [SIP CRON TRIGGERED] Executing due SIP: "${sip.name}" (ID: ${sip._id})`);
+      logger.info("sip_cron_triggered", { sipId: String(sip._id), name: sip.name });
       try {
         await executeSipInternal(sip._id);
       } catch (err) {
-        console.error(`Error in automated SIP execution for ${sip.name}:`, err.message);
+        logger.error("sip_cron_execution_error", { sipId: String(sip._id), error: err.message });
       }
     }
-  } catch (e) {}
-}, 45000);
+  } catch (e) {
+    logger.error("sip_worker_error", { error: e.message });
+  } finally {
+    await releaseDistributedLock("sip-heartbeat-worker", lockOwner);
+  }
+}
 
 
 // ============================================================================
@@ -3960,7 +4637,7 @@ setInterval(async () => {
 // ============================================================================
 
 // 1. Fetch user alerts with dynamic live LTP & proximity calculations
-app.get("/alerts", async (req, res) => {
+app.get("/alerts", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const statusFilter = req.query.status; // "ALL", "ACTIVE", "TRIGGERED", "DISABLED"
@@ -4013,9 +4690,9 @@ app.get("/alerts", async (req, res) => {
 });
 
 // 2. Create Price Alert
-app.post("/createAlert", async (req, res) => {
+app.post("/createAlert", requireAuth, async (req, res) => {
   try {
-    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
       return res.status(400).json({ success: false, message: "userId is required to create alert" });
     }
@@ -4071,12 +4748,16 @@ app.post("/createAlert", async (req, res) => {
 });
 
 // 3. Update Price Alert
-app.put("/updateAlert/:id", async (req, res) => {
+app.put("/updateAlert/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
     const { conditionType, targetPrice, targetPercentage, notes } = req.body;
 
-    const alert = await AlertModel.findById(id);
+    const alert = await AlertModel.findOne({ _id: id, userId });
     if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
 
     if (conditionType) alert.conditionType = conditionType;
@@ -4093,10 +4774,14 @@ app.put("/updateAlert/:id", async (req, res) => {
 });
 
 // 4. Toggle Status (Active <-> Disabled)
-app.patch("/toggleAlertStatus/:id", async (req, res) => {
+app.patch("/toggleAlertStatus/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const alert = await AlertModel.findById(id);
+    const alert = await AlertModel.findOne({ _id: id, userId });
     if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
 
     alert.status = alert.status === "ACTIVE" ? "DISABLED" : "ACTIVE";
@@ -4110,10 +4795,14 @@ app.patch("/toggleAlertStatus/:id", async (req, res) => {
 });
 
 // 5. Reset Triggered Alert back to Active
-app.post("/resetAlert/:id", async (req, res) => {
+app.post("/resetAlert/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const alert = await AlertModel.findById(id);
+    const alert = await AlertModel.findOne({ _id: id, userId });
     if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
 
     alert.status = "ACTIVE";
@@ -4129,10 +4818,15 @@ app.post("/resetAlert/:id", async (req, res) => {
 });
 
 // 6. Delete Alert
-app.delete("/deleteAlert/:id", async (req, res) => {
+app.delete("/deleteAlert/:id", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const deleted = await AlertModel.findByIdAndDelete(id);
+    const deleted = await AlertModel.findOneAndDelete({ _id: id, userId });
+    if (!deleted) return res.status(404).json({ success: false, message: "Alert not found" });
     if (deleted) {
       try {
         await createNotification({
@@ -4233,7 +4927,17 @@ async function evaluatePriceAlerts() {
   }
 }
 
-setInterval(evaluatePriceAlerts, 15000);
+let alertsWorkerInterval = null;
+async function runAlertsWorkerCycle() {
+  if (mongoose.connection.readyState !== 1) return;
+  const lockOwner = await acquireDistributedLock("price-alerts-worker", 13000);
+  if (!lockOwner) return;
+  try {
+    await evaluatePriceAlerts();
+  } finally {
+    await releaseDistributedLock("price-alerts-worker", lockOwner);
+  }
+}
 
 
 
@@ -4241,7 +4945,7 @@ setInterval(evaluatePriceAlerts, 15000);
 // 8. SEGMENT SETTINGS & KILL SWITCH SUBSYSTEM (SEBI / ZERODHA RISK CONTROLS)
 // ============================================================================
 
-app.get("/userSegments", async (req, res) => {
+app.get("/userSegments", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -4320,7 +5024,7 @@ app.get("/userSegments", async (req, res) => {
   }
 });
 
-app.post("/updateSegments", async (req, res) => {
+app.post("/updateSegments", requireAuth, authLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) {
@@ -4415,21 +5119,24 @@ app.post("/updateSegments", async (req, res) => {
 });
 
 // Segment Activation Verification OTP
-app.post("/sendSegmentOtp", async (req, res) => {
+app.post("/sendSegmentOtp", requireAuth, otpLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const user = await UserModel.findOne({ userId });
-    const userEmail = user?.email || req.body.email;
+    const userEmail = user?.email;
     if (!userEmail) {
       return res.status(400).json({ success: false, message: "No registered email address found for this user account." });
     }
-    const segmentKey = req.body.segmentKey;
+    const { segmentKey } = req.body;
+    if (!["equity", "futuresAndOptions", "currency", "commodity"].includes(segmentKey)) {
+      return res.status(400).json({ success: false, message: "Invalid trading segment requested." });
+    }
 
     const generatedOtp = crypto.randomInt(100000, 1000000).toString();
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
     await OtpModel.findOneAndUpdate(
-      { email: userEmail.toLowerCase() },
+      { email: `${userEmail.toLowerCase()}_seg_otp` },
       {
         otp: generatedOtp,
         attempts: 0,
@@ -4440,34 +5147,56 @@ app.post("/sendSegmentOtp", async (req, res) => {
     );
 
     const emailResult = await sendOtpEmail(userEmail, generatedOtp);
+    logger.info("segment_otp_dispatched", { userId, delivered: emailResult.delivered });
+
     res.status(200).json({
       success: true,
       message: `Verification OTP sent to ${userEmail}`,
       isLiveEmail: emailResult.delivered,
-      devOtp: emailResult.delivered ? undefined : generatedOtp,
+      devOtp: IS_TEST ? generatedOtp : undefined,
     });
   } catch (err) {
-    console.error("Error sending segment OTP:", err);
+    logger.error("segment_otp_send_error", { error: err.message });
     res.status(500).json({ success: false, message: "Failed to send verification code" });
   }
 });
 
-app.post("/verifySegmentOtp", async (req, res) => {
+app.post("/verifySegmentOtp", requireAuth, authLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const user = await UserModel.findOne({ userId });
-    const userEmail = (user?.email || req.body.email || "").toLowerCase();
+    if (!user || !user.email) {
+      return res.status(400).json({ success: false, message: "Registered user account not found." });
+    }
+    const userEmail = user.email.toLowerCase();
     const { otp, segmentKey, annualIncome } = req.body;
+    if (!["equity", "futuresAndOptions", "currency", "commodity"].includes(segmentKey)) {
+      return res.status(400).json({ success: false, message: "Invalid trading segment specified." });
+    }
 
-    const otpRecord = await OtpModel.findOne({ email: userEmail });
+    const otpKey = `${userEmail}_seg_otp`;
+    const otpRecord = await OtpModel.findOne({ email: otpKey });
     if (!otpRecord) {
       return res.status(400).json({ success: false, message: "No OTP found or expired. Please request a new code." });
     }
     if (new Date() > otpRecord.expiresAt) {
+      await OtpModel.deleteOne({ _id: otpRecord._id });
       return res.status(400).json({ success: false, message: "OTP has expired. Please request a new one." });
     }
-    if (otpRecord.otp !== otp?.toString().trim()) {
-      return res.status(400).json({ success: false, message: "Invalid verification code entered." });
+    if (otpRecord.attempts >= 5) {
+      await OtpModel.deleteOne({ _id: otpRecord._id });
+      return res.status(429).json({ success: false, message: "Too many failed verification attempts. Please request a new OTP." });
+    }
+
+    const cleanOtp = String(otp || "").trim();
+    if (!constantTimeEquals(String(otpRecord.otp), cleanOtp)) {
+      otpRecord.attempts += 1;
+      await otpRecord.save();
+      const remaining = Math.max(0, 5 - otpRecord.attempts);
+      return res.status(400).json({
+        success: false,
+        message: `Invalid verification code entered. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`,
+      });
     }
 
     // Activate segment
@@ -4524,51 +5253,53 @@ app.post("/verifySegmentOtp", async (req, res) => {
 // 9. CDSL E-DIS DEMAT AUTHORIZATION (TPIN & TRANSACTION OTP VIA EMAIL)
 // ============================================================================
 
-app.post("/cdsl/generate-tpin", async (req, res) => {
+app.post("/cdsl/generate-tpin", requireAuth, otpLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "User authentication required" });
-    }
     const user = await UserModel.findOne({ userId });
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
     }
-
-    const generatedTpin = crypto.randomInt(100000, 1000000).toString();
-    user.cdslTpin = generatedTpin;
-    await user.save();
 
     const toEmail = user.email;
     if (!toEmail) {
       return res.status(400).json({ success: false, message: "No registered email found for this user account. Please update your profile email." });
     }
-    const emailResult = await sendCdslTpinEmail(toEmail, generatedTpin, user.demat);
 
-    console.log(`🔐 [CDSL TPIN DISPATCHED] TPIN for user ${userId} (${toEmail}): ${generatedTpin}`);
+    const generatedTpin = crypto.randomInt(100000, 1000000).toString();
+    user.cdslTpin = hashPassword(generatedTpin);
+    user.cdslAttempts = 0;
+    user.cdslLockedUntil = null;
+    await user.save();
+
+    const emailResult = await sendCdslTpinEmail(toEmail, generatedTpin, user.demat);
+    logger.info("cdsl_tpin_dispatched", { userId, delivered: emailResult.delivered });
 
     res.status(200).json({
       success: true,
       message: `Your 6-digit CDSL TPIN has been sent to ${toEmail}`,
       isLiveEmail: emailResult.delivered,
-      devTpin: emailResult.delivered ? undefined : generatedTpin,
     });
   } catch (err) {
-    console.error("Error generating CDSL TPIN:", err);
+    logger.error("cdsl_generate_tpin_error", { error: err.message });
     res.status(500).json({ success: false, message: "Failed to dispatch CDSL TPIN" });
   }
 });
 
-app.post("/cdsl/verify-tpin", async (req, res) => {
+app.post("/cdsl/verify-tpin", requireAuth, authLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "User authentication required" });
-    }
     const { tpin, stockName, stockQty } = req.body;
     const user = await UserModel.findOne({ userId });
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
+    }
+
+    if (user.cdslLockedUntil && new Date(user.cdslLockedUntil) > new Date()) {
+      return res.status(429).json({
+        success: false,
+        message: "CDSL TPIN locked due to multiple failed attempts. Please try again later or generate a new TPIN.",
+      });
     }
 
     if (!user.cdslTpin) {
@@ -4578,12 +5309,33 @@ app.post("/cdsl/verify-tpin", async (req, res) => {
       });
     }
 
-    if (tpin !== user.cdslTpin) {
+    const cleanTpin = String(tpin || "").trim();
+    if (!cleanTpin || !verifyPassword(cleanTpin, user.cdslTpin)) {
+      user.cdslAttempts = (user.cdslAttempts || 0) + 1;
+      if (user.cdslAttempts >= 5) {
+        user.cdslLockedUntil = new Date(Date.now() + 15 * 60 * 1000);
+      }
+      await user.save();
+      if (user.cdslAttempts >= 5) {
+        return res.status(429).json({
+          success: false,
+          message: "Too many invalid TPIN attempts. CDSL authorization temporarily locked for 15 minutes.",
+        });
+      }
+      const remaining = 5 - user.cdslAttempts;
       return res.status(400).json({
         success: false,
-        message: "Invalid CDSL TPIN entered. Please check the code sent to your registered email.",
+        message: `Invalid CDSL TPIN entered. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`,
       });
     }
+
+    // Re-hash legacy plaintext TPIN upon successful verification + reset counters
+    if (!user.cdslTpin.includes(":")) {
+      user.cdslTpin = hashPassword(cleanTpin);
+    }
+    user.cdslAttempts = 0;
+    user.cdslLockedUntil = null;
+    await user.save();
 
     // TPIN is valid -> Generate Transaction OTP
     const generatedOtp = crypto.randomInt(100000, 1000000).toString();
@@ -4592,7 +5344,6 @@ app.post("/cdsl/verify-tpin", async (req, res) => {
       return res.status(400).json({ success: false, message: "No registered email address found for this user account." });
     }
 
-    // Store in OtpModel with cdsl identifier
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
     await OtpModel.findOneAndUpdate(
       { email: `${toEmail}_cdsl_otp` },
@@ -4606,28 +5357,24 @@ app.post("/cdsl/verify-tpin", async (req, res) => {
     );
 
     const emailResult = await sendCdslTransactionOtpEmail(toEmail, generatedOtp, stockName, stockQty);
-
-    console.log(`🔐 [CDSL OTP DISPATCHED] Transaction OTP for ${userId} (${toEmail}): ${generatedOtp}`);
+    logger.info("cdsl_otp_dispatched", { userId, delivered: emailResult.delivered });
 
     res.status(200).json({
       success: true,
       message: `Transaction OTP sent to ${toEmail}`,
       isLiveEmail: emailResult.delivered,
-      devOtp: emailResult.delivered ? undefined : generatedOtp,
+      devOtp: IS_TEST ? generatedOtp : undefined,
     });
   } catch (err) {
-    console.error("Error verifying CDSL TPIN:", err);
+    logger.error("cdsl_verify_tpin_error", { error: err.message });
     res.status(500).json({ success: false, message: "Failed to verify TPIN" });
   }
 });
 
-app.post("/cdsl/verify-otp", async (req, res) => {
+app.post("/cdsl/verify-otp", requireAuth, authLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "User authentication required" });
-    }
-    const { otp, stockName } = req.body;
+    const { otp } = req.body;
     const user = await UserModel.findOne({ userId });
     if (!user) {
       return res.status(404).json({ success: false, message: "User not found" });
@@ -4644,20 +5391,43 @@ app.post("/cdsl/verify-otp", async (req, res) => {
     }
 
     if (new Date() > otpRecord.expiresAt) {
+      await OtpModel.deleteOne({ _id: otpRecord._id });
       return res.status(400).json({
         success: false,
         message: "CDSL transaction OTP has expired. Please request a new code.",
       });
     }
 
-    if (otpRecord.otp !== otp?.toString().trim()) {
+    if (otpRecord.attempts >= 5) {
+      await OtpModel.deleteOne({ _id: otpRecord._id });
+      return res.status(429).json({
+        success: false,
+        message: "Too many failed CDSL OTP attempts. Please re-verify your TPIN.",
+      });
+    }
+
+    const cleanOtp = String(otp || "").trim();
+    if (!constantTimeEquals(String(otpRecord.otp), cleanOtp)) {
+      otpRecord.attempts += 1;
+      await otpRecord.save();
+      const remaining = Math.max(0, 5 - otpRecord.attempts);
       return res.status(400).json({
         success: false,
-        message: "Invalid transaction OTP entered. Please check the code sent to your email.",
+        message: `Invalid transaction OTP entered. ${remaining} attempt${remaining === 1 ? "" : "s"} remaining.`,
       });
     }
 
     await OtpModel.deleteOne({ _id: otpRecord._id });
+
+    // Persist server-side CDSL E-DIS authorization expiry in IST (valid for rest of IST trading/AMO day)
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const nowUtc = new Date();
+    const nowIst = new Date(nowUtc.getTime() + IST_OFFSET_MS);
+    const eodIst = new Date(nowIst);
+    eodIst.setUTCHours(23, 59, 59, 999);
+    const cdslAuthorizedUntil = new Date(eodIst.getTime() - IST_OFFSET_MS);
+    user.cdslAuthorizedUntil = cdslAuthorizedUntil;
+    await user.save();
 
     // In-App Notification
     try {
@@ -4666,14 +5436,15 @@ app.post("/cdsl/verify-otp", async (req, res) => {
         type: "ORDER",
         category: "SYSTEM",
         title: "CDSL Demat Authorized",
-        description: `Demat account authorized via CDSL E-DIS for exit transactions today until 3:30 PM.`,
+        description: `Demat account authorized via CDSL E-DIS for exit transactions today.`,
         metadata: { actionUrl: "/holdings" },
       });
     } catch (e) {}
 
     res.status(200).json({
       success: true,
-      message: "Demat holdings authorized successfully! Valid until 3:30 PM today.",
+      cdslAuthorizedUntil: cdslAuthorizedUntil.toISOString(),
+      message: "Demat holdings authorized successfully for today's trading session!",
     });
   } catch (err) {
     console.error("Error verifying CDSL OTP:", err);
@@ -4682,6 +5453,186 @@ app.post("/cdsl/verify-otp", async (req, res) => {
 });
 
 
-app.listen(PORT, () => {
-  console.log(`Backend server running on port ${PORT}!`);
+// ==========================================
+// SUPPORT TICKET ECOSYSTEM
+// ==========================================
+
+// 1. Register New Support Ticket
+app.post("/createSupportTicket", requireAuth, tradeFundsLimiter, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const {
+      category = "ORDERS",
+      categoryLabel,
+      subject,
+      description,
+      priority = "NORMAL",
+    } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+    const dbUser = await UserModel.findOne({ userId }).select("fullName email").lean();
+    if (!dbUser) {
+      return res.status(404).json({ success: false, message: "Authenticated user not found" });
+    }
+    const userName = dbUser.fullName || "Trader";
+    const userEmail = dbUser.email || "";
+
+    if (!subject || typeof subject !== "string" || !subject.trim() || subject.trim().length > 200) {
+      return res.status(400).json({ success: false, message: "Subject is required (max 200 characters)" });
+    }
+    if (!description || typeof description !== "string" || !description.trim() || description.trim().length > 4000) {
+      return res.status(400).json({ success: false, message: "Description is required (max 4000 characters)" });
+    }
+
+    const categoryLabels = {
+      FUNDS: "Funds, Payouts & Margins",
+      ORDERS: "Order Placement & Fills",
+      DEMAT: "Demat, Pledging & Holdings",
+      ACCOUNT: "Account Settings & KYC",
+      TECH: "Technical & Platform Query",
+      OTHER: "General Support Inquiry",
+    };
+
+    const finalCategoryLabel = categoryLabel || categoryLabels[category] || "General Support Inquiry";
+    const randomNum = crypto.randomInt(100000, 1000000);
+    const ticketId = `TKT-${randomNum}`;
+
+    const newTicket = new SupportTicketModel({
+      ticketId,
+      userId,
+      userName,
+      userEmail,
+      category,
+      categoryLabel: finalCategoryLabel,
+      subject: subject.trim(),
+      description: description.trim(),
+      priority,
+      status: "OPEN",
+      slaHours: priority === "URGENT" ? 1 : 2,
+      assignedTo: "Kite Customer Helpdesk",
+      createdAt: new Date(),
+    });
+
+    await newTicket.save();
+
+    // Trigger in-app notification for the user
+    try {
+      await createNotification({
+        userId,
+        type: "SYSTEM",
+        category: "SUPPORT_TICKET",
+        title: `Support Ticket #${ticketId} Registered`,
+        description: `Your ticket regarding '${subject.trim()}' has been registered under ${finalCategoryLabel}. Priority: ${priority}. Expected SLA: 2 business hours.`,
+        metadata: {
+          referenceId: ticketId,
+          actionUrl: "/support",
+        },
+        priority: priority === "URGENT" ? "HIGH" : "NORMAL",
+      });
+    } catch (notifErr) {
+      console.warn("Could not dispatch ticket notification:", notifErr.message);
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: `Support Ticket #${ticketId} created successfully. Our team will resolve it within 2 business hours.`,
+      ticket: newTicket,
+    });
+  } catch (err) {
+    console.error("Error creating support ticket:", err);
+    return res.status(500).json({ success: false, message: "Failed to create support ticket" });
+  }
 });
+
+// 2. Fetch User's Registered Support Tickets
+app.get("/mySupportTickets", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+
+    const tickets = await SupportTicketModel.find({ userId }).sort({ createdAt: -1 });
+    return res.status(200).json({
+      success: true,
+      count: tickets.length,
+      tickets,
+    });
+  } catch (err) {
+    console.error("Error fetching support tickets:", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch support tickets" });
+  }
+});
+
+// Global Error Handler (prevents stack trace leakage in production)
+app.use((err, req, res, next) => {
+  console.error("Unhandled Express Error:", err?.message || err);
+  if (err && err.type === "entity.parse.failed") {
+    return res.status(400).json({ success: false, message: "Malformed JSON payload" });
+  }
+  if (err && err.name === "CastError") {
+    return res.status(400).json({ success: false, message: "Invalid identifier format" });
+  }
+  if (err && typeof err.message === "string" && err.message.startsWith("CORS origin blocked")) {
+    return res.status(403).json({ success: false, message: "Origin not allowed by CORS policy" });
+  }
+  return res.status(err?.status || 500).json({
+    success: false,
+    message: process.env.NODE_ENV === "production" ? "Internal server error" : err?.message || "Internal server error",
+  });
+});
+
+let serverInstance = null;
+
+function startBackgroundWorkers() {
+  if (!sipWorkerInterval) {
+    sipWorkerInterval = setInterval(runSipWorkerCycle, 45000);
+    if (sipWorkerInterval.unref) sipWorkerInterval.unref();
+  }
+  if (!alertsWorkerInterval) {
+    alertsWorkerInterval = setInterval(runAlertsWorkerCycle, 15000);
+    if (alertsWorkerInterval.unref) alertsWorkerInterval.unref();
+  }
+}
+
+function stopBackgroundWorkers() {
+  if (sipWorkerInterval) {
+    clearInterval(sipWorkerInterval);
+    sipWorkerInterval = null;
+  }
+  if (alertsWorkerInterval) {
+    clearInterval(alertsWorkerInterval);
+    alertsWorkerInterval = null;
+  }
+}
+
+function startServer(port = PORT) {
+  startBackgroundWorkers();
+  serverInstance = app.listen(port, () => {
+    logger.info("server_started", { port, env: NODE_ENV });
+  });
+  serverInstance.setTimeout(30000);
+  return serverInstance;
+}
+
+async function shutdown(signal) {
+  logger.info("shutdown_initiated", { signal });
+  stopBackgroundWorkers();
+  if (serverInstance) {
+    await new Promise((resolve) => serverInstance.close(resolve));
+    serverInstance = null;
+  }
+  await mongoose.connection.close().catch(() => {});
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = { app, startServer, shutdown };

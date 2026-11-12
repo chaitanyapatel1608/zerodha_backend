@@ -16,21 +16,21 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "test:unit": "node --test tests/unit_utils.test.js",
+    "test": "node --test --test-concurrency=1 tests/unit_utils.test.js tests/security.test.js tests/auth_financial.test.js tests/security_regression.test.js tests/trading_lifecycle.test.js"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"
   },
   "dependencies": {
-    "body-parser": "^2.4.0",
     "cors": "^2.8.6",
     "dotenv": "^18.0.9",
     "express": "^5.3.0",
     "express-rate-limit": "^8.7.2",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.11.4",
-    "nodemailer": "^10.3.1",
-    "passport": "^0.7.0",
-    "passport-local": "^1.0.0"
+    "nodemailer": "^10.3.1"
   }
 }

@@ -77,6 +77,7 @@ const IpoApplicationSchema = new Schema(
       required: true,
       unique: true,
     },
+    mandateExpiresAt: { type: Date },
     status: {
       type: String,
       enum: ["MANDATE_PENDING", "APPLIED", "ALLOTTED", "REFUNDED", "CANCELLED"],
