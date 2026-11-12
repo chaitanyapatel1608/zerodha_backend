@@ -7,12 +7,22 @@ const bodyParser = require("body-parser");
 const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
+const {
+  hashPassword,
+  verifyPassword,
+  escapeRegex,
+  resolveAuthenticatedUserId,
+} = require("./utils/security");
 
 const { HoldingsModel } = require("./model/HoldingsModel");
 const { PositionsModel } = require("./model/PositionsModel");
 const { OrdersModel } = require("./model/OrdersModel");
 const { WatchlistModel } = require("./model/WatchlistModel");
 const { FundsModel } = require("./model/FundsModel");
+const { FundsTransactionModel } = require("./model/FundsTransactionModel");
+const { PledgedCollateralModel } = require("./model/PledgedCollateralModel");
+const { BankAccountModel } = require("./model/BankAccountModel");
 const { IpoModel } = require("./model/IpoModel");
 const { IpoApplicationModel } = require("./model/IpoApplicationModel");
 const { GsecBidModel } = require("./model/GsecBidModel");
@@ -27,11 +37,13 @@ const { BasketModel } = require("./model/BasketModel");
 const { SipModel } = require("./model/SipModel");
 const { UserWatchlistModel } = require("./model/UserWatchlistModel");
 const { NotificationModel } = require("./model/NotificationModel");
+const { SupportTicketModel } = require("./model/SupportTicketModel");
 const { masterInstruments } = require("./data/masterInstruments");
 const { OtpModel } = require("./model/OtpModel");
 const {
   sendOtpEmail,
   sendIpoMandateEmail,
+  sendFundDepositEmail,
   sendSipFailureEmail,
   sendSipSuccessEmail,
   sendAlertTriggeredEmail,
@@ -48,17 +60,69 @@ const { seedCatalogsToDb } = require("./data/seedCatalogsToDb");
 const app = express();
 const PORT = process.env.PORT || 3002;
 const uri = process.env.MONGO_URL;
+
+if (process.env.NODE_ENV === "production" && !process.env.JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET environment variable must be set in production.");
+  process.exit(1);
+}
 const JWT_SECRET = process.env.JWT_SECRET || "zerodha_jwt_super_secret_key_2026_finance_kite";
 
-// Middlewares
-app.use(cors());
-app.use(bodyParser.json());
+// Environment & Host Configuration
+const PUBLIC_FRONTEND_URL = process.env.PUBLIC_FRONTEND_URL || "http://localhost:3001";
+const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || "http://localhost:3002";
 
-// Rate Limiter for OTP requests (15 requests per 10 minutes per IP)
+
+// Middlewares & Security Headers
+app.disable("x-powered-by");
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  })
+);
+
+const allowedOrigins = [
+  "http://localhost:3000",
+  "http://localhost:3001",
+  process.env.FRONTEND_URL,
+  process.env.PUBLIC_FRONTEND_URL,
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin || allowedOrigins.includes(origin) || process.env.NODE_ENV !== "production") {
+        return callback(null, true);
+      }
+      return callback(new Error("CORS origin blocked by policy: " + origin));
+    },
+    credentials: true,
+  })
+);
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+
+// Rate Limiters
 const otpLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 15,
   message: { success: false, message: "Too many OTP requests. Please wait a few minutes before trying again." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 25,
+  message: { success: false, message: "Too many authentication attempts. Please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const tradeFundsLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  message: { success: false, message: "Rate limit exceeded for sensitive actions. Please slow down." },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -86,7 +150,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
       const cleanId = identifier.trim();
       const existing = await UserModel.findOne({
         $or: [
-          { userId: { $regex: new RegExp(`^${cleanId}$`, "i") } },
+          { userId: { $regex: new RegExp(`^${escapeRegex(cleanId)}$`, "i") } },
           { email: cleanId.toLowerCase() },
           { phone: cleanId },
         ],
@@ -190,7 +254,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
         ? `A 6-digit verification code has been sent to ${normalizedEmail}`
         : `Verification code sent to ${normalizedEmail}`,
       isLiveEmail: emailResult.delivered,
-      devOtp: emailResult.delivered ? undefined : generatedOtp,
+      devOtp: process.env.NODE_ENV === "test" ? generatedOtp : undefined,
     });
   } catch (error) {
     console.error("Error sending OTP:", error);
@@ -199,7 +263,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
 });
 
 // 2. Verify OTP Endpoint (Unified Signup & Login)
-app.post("/verify-otp", async (req, res) => {
+app.post("/verify-otp", authLimiter, async (req, res) => {
   try {
     const { email, otp, type, fullName, phone, pan, dob, annualIncome, tradingExp } = req.body;
 
@@ -383,7 +447,7 @@ app.post("/verify-otp", async (req, res) => {
 });
 
 // 2.5 Kite Direct / Password Login & Lookup Endpoint
-app.post("/kite-login", async (req, res) => {
+app.post("/kite-login", authLimiter, async (req, res) => {
   try {
     const { identifier, password } = req.body;
     if (!identifier || !identifier.trim()) {
@@ -392,7 +456,7 @@ app.post("/kite-login", async (req, res) => {
     const cleanId = identifier.trim();
     const user = await UserModel.findOne({
       $or: [
-        { userId: { $regex: new RegExp(`^${cleanId}$`, "i") } },
+        { userId: { $regex: new RegExp(`^${escapeRegex(cleanId)}$`, "i") } },
         { email: cleanId.toLowerCase() },
         { phone: cleanId },
       ],
@@ -407,11 +471,17 @@ app.post("/kite-login", async (req, res) => {
     }
 
     if (user.password && password) {
-      if (user.password !== password) {
+      const isValid = verifyPassword(password, user.password);
+      if (!isValid) {
         return res.status(401).json({ success: false, message: "Incorrect password. Please try again." });
       }
+      // Upgrade plaintext to scrypt hash if needed
+      if (!user.password.includes(":")) {
+        user.password = hashPassword(password);
+        await user.save();
+      }
     } else if (password && !user.password) {
-      user.password = password;
+      user.password = hashPassword(password);
       await user.save();
     }
 
@@ -457,23 +527,9 @@ app.post("/kite-login", async (req, res) => {
 
 // 3. Verify Active Session Token
 
-// Helper: Resolve dynamic userId from JWT token, query param, or request body (strictly multi-user)
+// Helper: Resolve dynamic userId from verified JWT token
 function getAuthenticatedUserId(req) {
-  const authHeader = req.headers?.authorization;
-  if (authHeader && authHeader.startsWith("Bearer ")) {
-    try {
-      const token = authHeader.split(" ")[1];
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded && decoded.userId) {
-        return decoded.userId;
-      }
-    } catch (e) {}
-  }
-  const explicitId = req.query?.userId || req.body?.userId;
-  if (explicitId && typeof explicitId === "string" && explicitId.trim() !== "") {
-    return explicitId.trim();
-  }
-  return null;
+  return resolveAuthenticatedUserId(req, JWT_SECRET, process.env.NODE_ENV);
 }
 
 app.get("/verifyUser", async (req, res) => {
@@ -1286,7 +1342,7 @@ const formatIndianCurrency = (num) => {
 };
 
 // 1. Transactional Order Engine with Portfolio & Funds Synchronization
-app.post("/newOrder", async (req, res) => {
+app.post("/newOrder", tradeFundsLimiter, async (req, res) => {
   try {
     const { name, qty, price, mode = "BUY", product = "CNC" } = req.body;
     const userId = getAuthenticatedUserId(req);
@@ -1623,10 +1679,11 @@ app.get("/allIpos", async (req, res) => {
 // Add or Update Demat Nominee (SEBI Compliance - Up to 3 Nominees)
 app.post("/addNominee", async (req, res) => {
   try {
-    const { userId, nominees, optOut } = req.body;
+    const userId = getAuthenticatedUserId(req);
+    const { nominees, optOut } = req.body;
 
     if (!userId) {
-      return res.status(400).json({ success: false, message: "User ID is required." });
+      return res.status(401).json({ success: false, message: "Authentication required." });
     }
 
     const user = await UserModel.findOne({ userId });
@@ -1808,9 +1865,9 @@ app.post("/addNominee", async (req, res) => {
 // Get Nominee Status & Details
 app.get("/getNominee", async (req, res) => {
   try {
-    const { userId } = req.query;
+    const userId = getAuthenticatedUserId(req);
     if (!userId) {
-      return res.status(400).json({ success: false, message: "User ID is required" });
+      return res.status(401).json({ success: false, message: "Authentication required" });
     }
     const user = await UserModel.findOne({ userId });
     if (!user) {
@@ -1928,15 +1985,22 @@ app.post("/newGtt", async (req, res) => {
 
 app.post("/cancelGtt", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.body;
     if (!id) {
       return res.status(400).json({ success: false, message: "GTT ID required" });
     }
-    const updated = await GttModel.findByIdAndUpdate(
-      id,
+    const updated = await GttModel.findOneAndUpdate(
+      { _id: id, userId },
       { status: "CANCELLED" },
       { new: true }
     );
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "GTT order not found" });
+    }
     res.status(200).json({ success: true, message: "GTT order cancelled", gtt: updated });
   } catch (error) {
     console.error("Error cancelling GTT:", error);
@@ -1946,10 +2010,14 @@ app.post("/cancelGtt", async (req, res) => {
 
 app.post("/triggerGtt", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.body;
-    const gtt = await GttModel.findById(id);
+    const gtt = await GttModel.findOne({ _id: id, userId });
     if (!gtt || gtt.status !== "ACTIVE") {
-      return res.status(400).json({ success: false, message: "GTT not found or already triggered" });
+      return res.status(404).json({ success: false, message: "GTT not found or already triggered" });
     }
 
     // Place the order
@@ -2197,8 +2265,15 @@ app.post("/saveBasket", async (req, res) => {
 
 app.delete("/deleteBasket/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    await BasketModel.findByIdAndDelete(id);
+    const deleted = await BasketModel.findOneAndDelete({ _id: id, userId });
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "Basket not found" });
+    }
     res.status(200).json({ success: true, message: "Basket deleted successfully" });
   } catch (error) {
     console.error("Error deleting basket:", error);
@@ -2380,41 +2455,702 @@ app.post("/notifications/clearAll", async (req, res) => {
   }
 });
 
-// 7. Dynamic Funds deposit endpoint with automatic ledger & notification synchronization
-app.post("/addFunds", async (req, res) => {
-  try {
-    const userId = getAuthenticatedUserId(req);
-    const { amount = 10000, method = "UPI" } = req.body;
-    let funds = await getOrCreateUserFunds(userId);
-    const numAmount = parseFloat(amount);
-    let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
-    currentAvailable += numAmount;
-    funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-    funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-    await funds.save();
+// ============================================================================
+// FUNDS TREASURY & INTERACTIVE UPI EMAIL COLLECT ENGINE
+// ============================================================================
 
-    const refId = "UPI" + Math.floor(10000000000 + Math.random() * 90000000000);
-    await createNotification({
+// 1. Initiate Fund Deposit (Dispatches Interactive UPI Collect Email)
+app.post("/fundDeposit/initiate", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+
+    const { amount, upiId } = req.body;
+    const numAmount = parseFloat(amount);
+    if (!numAmount || numAmount <= 0) {
+      return res.status(400).json({ success: false, message: "Please enter a valid deposit amount." });
+    }
+
+    if (!upiId || !upiId.includes("@")) {
+      return res.status(400).json({ success: false, message: "Please provide a valid UPI ID (e.g. yourname@okhdfcbank)." });
+    }
+
+    // Resolve user email
+    let userEmail = req.body.userEmail;
+    if (!userEmail) {
+      const user = await UserModel.findOne({ userId });
+      userEmail = user?.email || "chaitanya.expound@gmail.com";
+    }
+
+    const approvalToken = crypto.randomBytes(32).toString("hex");
+    const referenceId = "UPI" + Math.floor(10000000000 + Math.random() * 90000000000);
+
+    const newTx = new FundsTransactionModel({
       userId,
-      type: "FUNDS",
-      category: "MARGIN",
-      title: "Funds Credited",
-      description: `₹${formatIndianCurrency(numAmount)} added via ${method} (Ref: ${refId}). Margin updated.`,
-      metadata: {
-        amount: numAmount,
-        referenceId: refId,
-        actionUrl: "/funds",
-      },
+      type: "PAYIN",
+      amount: numAmount,
+      paymentMethod: "UPI",
+      upiId: upiId.trim(),
+      status: "PENDING_APPROVAL",
+      referenceId,
+      approvalToken,
+      remarks: `Instant UPI Payin via ${upiId.trim()}`,
     });
+    await newTx.save();
+
+    const approveUrl = `${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${approvalToken}&decision=APPROVE`;
+    const declineUrl = `${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${approvalToken}&decision=REJECT`;
+
+    // Send interactive approval email via Nodemailer
+    await sendFundDepositEmail({
+      toEmail: userEmail,
+      amount: numAmount,
+      upiId: upiId.trim(),
+      referenceId,
+      approveUrl,
+      declineUrl,
+    });
+
+    try {
+      await createNotification({
+        userId,
+        type: "FUNDS",
+        category: "MARGIN",
+        title: "UPI Payin Initiated",
+        description: `UPI collect request for ₹${formatIndianCurrency(numAmount)} sent to ${upiId}. Please approve via email. Ref: ${referenceId}.`,
+        metadata: {
+          amount: numAmount,
+          referenceId,
+          actionUrl: "/funds",
+        },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `UPI Collect Request sent to ${upiId}! Please approve the payment via the authorization email sent to ${userEmail}.`,
+      transaction: newTx,
+      approveUrl, // Included for seamless 1-click in-app simulation testing
+    });
+  } catch (error) {
+    console.error("Error initiating fund deposit:", error);
+    res.status(500).json({ success: false, message: "Failed to initiate fund deposit." });
+  }
+});
+
+// 2. Interactive Email Action (Approve / Decline from Gmail or direct link)
+app.get("/fundDeposit/action", async (req, res) => {
+  try {
+    const { token, decision } = req.query;
+    if (!token || !decision) {
+      return res.status(400).send("<h3>Invalid or missing deposit action parameters.</h3>");
+    }
+
+    const tx = await FundsTransactionModel.findOne({ approvalToken: token });
+    if (!tx) {
+      return res.status(404).send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Request Expired</title><style>body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px; background: #f8fafc; color: #1e293b; }</style></head>
+        <body>
+          <h2 style="color: #ef4444;">Transfer Link Expired or Invalid</h2>
+          <p>We could not find an active deposit request associated with this token.</p>
+          <a href="${PUBLIC_FRONTEND_URL}/funds" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">Return to Zerodha Kite</a>
+        </body>
+        </html>
+      `);
+    }
+
+    if (tx.status !== "PENDING_APPROVAL") {
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head><title>Transfer Already Processed</title><style>body { font-family: -apple-system, sans-serif; text-align: center; padding: 50px; background: #f8fafc; color: #1e293b; }</style></head>
+        <body>
+          <h2>Transfer Already Processed</h2>
+          <p>This deposit request (Ref: <strong>${tx.referenceId}</strong>) has already been marked as <strong>${tx.status}</strong>.</p>
+          <a href="${PUBLIC_FRONTEND_URL}/funds" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">View in Zerodha Kite</a>
+        </body>
+        </html>
+      `);
+    }
+
+    const isApprove = decision.toUpperCase() === "APPROVE";
+    if (isApprove) {
+      tx.status = "COMPLETED";
+      tx.completedAt = new Date();
+      await tx.save();
+
+      // Credit funds to user account
+      const funds = await getOrCreateUserFunds(tx.userId);
+      let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
+      let currentPayin = parseFloat((funds.equity.payin || "0").replace(/,/g, "")) || 0;
+
+      currentAvailable += tx.amount;
+      currentPayin += tx.amount;
+
+      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
+      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
+      funds.equity.payin = formatIndianCurrency(currentPayin);
+      await funds.save();
+
+      // Dispatch in-app notification
+      try {
+        await createNotification({
+          userId: tx.userId,
+          type: "FUNDS",
+          category: "MARGIN",
+          title: "Funds Credited Successfully",
+          description: `₹${formatIndianCurrency(tx.amount)} credited to your trading account via UPI (${tx.upiId}). Margin available immediately. Ref: ${tx.referenceId}.`,
+          metadata: {
+            amount: tx.amount,
+            referenceId: tx.referenceId,
+            actionUrl: "/funds",
+          },
+        });
+      } catch (e) {}
+
+      console.log(`✅ [FUNDS CREDITED] Credited ₹${tx.amount} to user ${tx.userId} (Ref: ${tx.referenceId})`);
+
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Payment Approved - Zerodha Kite</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; }
+            .receipt-card { max-width: 500px; margin: 0 auto; background: #fff; padding: 36px 28px; border-radius: 8px; border: 1px solid #e2e8f0; box-shadow: 0 10px 25px rgba(0,0,0,0.06); }
+            .success-icon { width: 64px; height: 64px; line-height: 64px; border-radius: 50%; background: #dcfce7; color: #16a34a; font-size: 32px; margin: 0 auto 16px auto; }
+            h2 { margin: 0 0 8px 0; color: #0f172a; font-size: 24px; }
+            p { color: #64748b; font-size: 14px; line-height: 1.5; margin: 0 0 24px 0; }
+            .details-table { width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 13.5px; text-align: left; }
+            .details-table td { padding: 10px 0; border-bottom: 1px solid #f1f5f9; }
+            .details-table .label { color: #64748b; }
+            .details-table .val { font-weight: 600; text-align: right; color: #0f172a; }
+            .btn-return { display: inline-block; background: #16a34a; color: #fff; text-decoration: none; padding: 12px 28px; border-radius: 4px; font-weight: 600; font-size: 14px; }
+          </style>
+        </head>
+        <body>
+          <div class="receipt-card">
+            <div class="success-icon">✓</div>
+            <h2>Funds Credited Successfully!</h2>
+            <p>Your UPI payment has been confirmed. The funds are immediately available for trading on Zerodha Kite.</p>
+            <table class="details-table">
+              <tr><td class="label">Amount Credited</td><td class="val" style="color: #16a34a; font-size: 18px;">₹${formatIndianCurrency(tx.amount)}</td></tr>
+              <tr><td class="label">Reference ID</td><td class="val" style="font-family: monospace;">${tx.referenceId}</td></tr>
+              <tr><td class="label">Payer UPI ID</td><td class="val">${tx.upiId}</td></tr>
+              <tr><td class="label">Target Segment</td><td class="val">Equity & F&O Margin</td></tr>
+              <tr><td class="label">Status</td><td class="val" style="color: #16a34a;">Completed</td></tr>
+            </table>
+            <a href="${PUBLIC_FRONTEND_URL}/funds" class="btn-return">View in Zerodha Kite Dashboard &rsaquo;</a>
+          </div>
+        </body>
+        </html>
+      `);
+    } else {
+      tx.status = "REJECTED";
+      tx.completedAt = new Date();
+      await tx.save();
+
+      try {
+        await createNotification({
+          userId: tx.userId,
+          type: "FUNDS",
+          category: "MARGIN",
+          title: "UPI Transfer Declined",
+          description: `UPI deposit request of ₹${formatIndianCurrency(tx.amount)} was declined. Ref: ${tx.referenceId}.`,
+          metadata: {
+            amount: tx.amount,
+            referenceId: tx.referenceId,
+            actionUrl: "/funds",
+          },
+        });
+      } catch (e) {}
+
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+          <meta charset="utf-8">
+          <title>Transfer Declined - Zerodha Kite</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; }
+            .receipt-card { max-width: 500px; margin: 0 auto; background: #fff; padding: 36px 28px; border-radius: 8px; border: 1px solid #e2e8f0; }
+            .decline-icon { width: 56px; height: 56px; line-height: 56px; border-radius: 50%; background: #fee2e2; color: #dc2626; font-size: 28px; margin: 0 auto 16px auto; }
+            h2 { margin: 0 0 8px 0; color: #dc2626; font-size: 22px; }
+            p { color: #64748b; font-size: 14px; line-height: 1.5; margin: 0 0 24px 0; }
+            .btn-return { display: inline-block; background: #64748b; color: #fff; text-decoration: none; padding: 12px 28px; border-radius: 4px; font-weight: 500; font-size: 14px; }
+          </style>
+        </head>
+        <body>
+          <div class="receipt-card">
+            <div class="decline-icon">✕</div>
+            <h2>UPI Transfer Declined</h2>
+            <p>You have declined the fund deposit request for <strong>₹${formatIndianCurrency(tx.amount)}</strong>. No money was transferred.</p>
+            <a href="${PUBLIC_FRONTEND_URL}/funds" class="btn-return">Return to Dashboard</a>
+          </div>
+        </body>
+        </html>
+      `);
+    }
+  } catch (error) {
+    console.error("Error processing fund deposit action:", error);
+    res.status(500).send("<h3>Server error processing deposit authorization.</h3>");
+  }
+});
+
+// 3. Fetch User's Funds Transaction Ledger
+app.get("/fundsTransactions", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) return res.status(200).json([]);
+    const transactions = await FundsTransactionModel.find({ userId }).sort({ createdAt: -1 });
+    res.status(200).json(transactions);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch funds transactions" });
+  }
+});
+
+// ============================================================================
+// DYNAMIC LINKED BANK ACCOUNTS (SEBI PENNY-DROP VERIFIED)
+// ============================================================================
+
+// 1. Get User's Linked Bank Accounts
+app.get("/userBankAccounts", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) return res.status(200).json([]);
+
+    let accounts = await BankAccountModel.find({ userId }).sort({ isPrimary: -1, createdAt: 1 });
+
+    // Seed default verified account if user has none
+    if (accounts.length === 0) {
+      const defaultAccount = new BankAccountModel({
+        userId,
+        bankName: "HDFC Bank",
+        accountNumber: "50100482194821",
+        maskedAccountNumber: "····4821",
+        ifscCode: "HDFC0000060",
+        branch: "Fort, Mumbai",
+        accountType: "SAVINGS",
+        isPrimary: true,
+        status: "VERIFIED",
+        pennyDropRef: "PD" + Math.floor(100000000 + Math.random() * 900000000),
+      });
+      await defaultAccount.save();
+      accounts = [defaultAccount];
+    }
+
+    res.status(200).json(accounts);
+  } catch (error) {
+    console.error("Error fetching bank accounts:", error);
+    res.status(500).json({ error: "Failed to fetch bank accounts" });
+  }
+});
+
+// 2. Add New Bank Account (Dynamic Linking & Penny Drop Simulation)
+app.post("/addBankAccount", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+
+    const { bankName, accountNumber, ifscCode, accountType = "SAVINGS", branch = "Main Branch", isPrimary = false } = req.body;
+
+    if (!bankName || !accountNumber || !ifscCode) {
+      return res.status(400).json({ success: false, message: "Bank name, account number, and IFSC code are required." });
+    }
+
+    const cleanAcc = accountNumber.toString().trim();
+    if (cleanAcc.length < 8) {
+      return res.status(400).json({ success: false, message: "Please provide a valid bank account number (min 8 digits)." });
+    }
+
+    const cleanIfsc = ifscCode.toString().trim().toUpperCase();
+    const ifscRegex = /^[A-Z]{4}0[A-Z0-9]{6}$/;
+    if (!ifscRegex.test(cleanIfsc)) {
+      return res.status(400).json({ success: false, message: "Invalid IFSC Code format. E.g. HDFC0000060 or SBIN0001234." });
+    }
+
+    const masked = "····" + cleanAcc.slice(-4);
+    const existingCount = await BankAccountModel.countDocuments({ userId });
+    const shouldBePrimary = isPrimary || existingCount === 0;
+
+    // If setting as primary, unset any existing primary
+    if (shouldBePrimary) {
+      await BankAccountModel.updateMany({ userId }, { $set: { isPrimary: false } });
+    }
+
+    const pennyDropRef = "PD" + Math.floor(100000000 + Math.random() * 900000000);
+
+    const newAccount = new BankAccountModel({
+      userId,
+      bankName: bankName.trim(),
+      accountNumber: cleanAcc,
+      maskedAccountNumber: masked,
+      ifscCode: cleanIfsc,
+      branch: branch.trim(),
+      accountType: accountType.toUpperCase() === "CURRENT" ? "CURRENT" : "SAVINGS",
+      isPrimary: shouldBePrimary,
+      status: "VERIFIED",
+      pennyDropRef,
+    });
+    await newAccount.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "COMPLIANCE",
+        category: "BANK_ACCOUNT",
+        title: "Bank Account Linked Successfully",
+        description: `${bankName.trim()} A/C (${masked}) successfully verified via NPCI Penny Drop and linked to your Zerodha trading account.`,
+        metadata: {
+          accountNumber: masked,
+          actionUrl: "/funds",
+        },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `${bankName.trim()} A/C (${masked}) linked and verified successfully!`,
+      account: newAccount,
+    });
+  } catch (error) {
+    console.error("Error adding bank account:", error);
+    res.status(500).json({ success: false, message: "Failed to link bank account." });
+  }
+});
+
+// 3. Set Primary Bank Account
+app.put("/setPrimaryBankAccount/:id", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    const { id } = req.params;
+
+    await BankAccountModel.updateMany({ userId }, { $set: { isPrimary: false } });
+    const account = await BankAccountModel.findOneAndUpdate(
+      { _id: id, userId },
+      { $set: { isPrimary: true } },
+      { new: true }
+    );
+
+    if (!account) {
+      return res.status(404).json({ success: false, message: "Bank account not found." });
+    }
 
     res.status(200).json({
       success: true,
-      message: `₹${formatIndianCurrency(numAmount)} deposited successfully.`,
+      message: `${account.bankName} (${account.maskedAccountNumber}) is now your Primary bank account for withdrawals.`,
+      account,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to update primary bank account." });
+  }
+});
+
+// 4. Delete Bank Account
+app.delete("/deleteBankAccount/:id", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    const { id } = req.params;
+
+    const account = await BankAccountModel.findOne({ _id: id, userId });
+    if (!account) {
+      return res.status(404).json({ success: false, message: "Bank account not found." });
+    }
+
+    if (account.isPrimary) {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot delete your Primary bank account. Please set another account as primary first.",
+      });
+    }
+
+    await BankAccountModel.deleteOne({ _id: id, userId });
+    res.status(200).json({ success: true, message: "Bank account unlinked successfully." });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to delete bank account." });
+  }
+});
+
+// Per-user in-flight lock to prevent concurrent withdrawal race conditions (TOCTOU)
+const withdrawalLocks = new Set();
+
+// 4. Withdraw Funds Endpoint (SEBI Clearance Cycle)
+app.post("/withdrawFunds", tradeFundsLimiter, async (req, res) => {
+  const userId = getAuthenticatedUserId(req);
+  if (!userId) {
+    return res.status(401).json({ success: false, message: "User authentication required" });
+  }
+  if (withdrawalLocks.has(userId)) {
+    return res.status(429).json({ success: false, message: "A withdrawal request is already in progress. Please wait." });
+  }
+  withdrawalLocks.add(userId);
+  try {
+    const { amount, bankAccount = "HDFC Bank ····4821", upiId } = req.body;
+    const numAmount = Number(amount);
+    if (!Number.isFinite(numAmount) || numAmount <= 0 || numAmount > 100000000) {
+      return res.status(400).json({ success: false, message: "Please enter a valid withdrawal amount between ₹1 and ₹10,00,00,000." });
+    }
+
+    const funds = await getOrCreateUserFunds(userId);
+    const previousCashStr = funds.equity.availableCash;
+    let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
+    let currentCash = parseFloat(previousCashStr.replace(/,/g, "")) || 0;
+    let currentPayout = parseFloat((funds.equity.payout || "0").replace(/,/g, "")) || 0;
+
+    if (numAmount > currentCash) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient withdrawable cash balance! You can withdraw up to ₹${formatIndianCurrency(currentCash)}.`,
+      });
+    }
+
+    currentAvailable -= numAmount;
+    currentCash -= numAmount;
+    currentPayout += numAmount;
+
+    const updatedFunds = await FundsModel.findOneAndUpdate(
+      { _id: funds._id, "equity.availableCash": previousCashStr },
+      {
+        $set: {
+          "equity.availableMargin": formatIndianCurrency(currentAvailable),
+          "equity.availableCash": formatIndianCurrency(currentCash),
+          "equity.payout": formatIndianCurrency(currentPayout),
+        },
+      },
+      { new: true }
+    );
+    if (!updatedFunds) {
+      return res.status(409).json({ success: false, message: "Balance changed concurrently. Please retry withdrawal." });
+    }
+
+    const referenceId = "PAYOUT" + Math.floor(10000000000 + Math.random() * 90000000000);
+    const newTx = new FundsTransactionModel({
+      userId,
+      type: "PAYOUT",
+      amount: numAmount,
+      paymentMethod: upiId ? "UPI" : "NEFT/RTGS",
+      upiId: upiId || null,
+      bankAccount,
+      status: "COMPLETED",
+      referenceId,
+      remarks: `Withdrawal to ${bankAccount}`,
+      completedAt: new Date(),
+    });
+    await newTx.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "FUNDS",
+        category: "MARGIN",
+        title: "Funds Withdrawal Requested",
+        description: `Withdrawal request for ₹${formatIndianCurrency(numAmount)} submitted. Crediting to ${bankAccount} by 06:00 IST tomorrow. Ref: ${referenceId}.`,
+        metadata: {
+          amount: numAmount,
+          referenceId,
+          actionUrl: "/funds",
+        },
+      });
+    } catch (e) {}
+
+    res.status(200).json({
+      success: true,
+      message: `₹${formatIndianCurrency(numAmount)} withdrawal processed! Funds will be credited to ${bankAccount}.`,
+      funds: updatedFunds.equity,
+      transaction: newTx,
+    });
+  } catch (error) {
+    console.error("Error withdrawing funds:", error);
+    res.status(500).json({ success: false, message: "Failed to process withdrawal request." });
+  } finally {
+    withdrawalLocks.delete(userId);
+  }
+});
+
+// 5. Margin Pledging: Pledge Demat Holdings for Trading Collateral
+app.post("/pledgeHolding", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+
+    const { symbol, companyName, quantity, marketPrice } = req.body;
+    const numQty = Math.max(1, parseInt(quantity) || 1);
+    const numPrice = parseFloat(marketPrice) || 100;
+
+    // Verify holding
+    const holding = await HoldingsModel.findOne({
+      userId,
+      $or: [{ name: symbol }, { instrument: symbol }],
+    });
+
+    const ownedQty = holding ? holding.qty : 0;
+    if (ownedQty < numQty) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient Demat shares! You hold ${ownedQty} shares of ${symbol}, but attempted to pledge ${numQty} shares.`,
+      });
+    }
+
+    // Standard SEBI Haircuts: Bluechips 12.5%, Large-cap 15%, Others 20%
+    let haircutPercent = 20;
+    const sym = symbol.toUpperCase();
+    if (sym === "RELIANCE" || sym === "TCS") haircutPercent = 12.5;
+    else if (sym === "INFY" || sym === "HDFCBANK" || sym === "ICICIBANK") haircutPercent = 15;
+
+    const totalVal = numQty * numPrice;
+    const collateralValue = Number((totalVal * (1 - haircutPercent / 100)).toFixed(2));
+    const pledgeRef = "PLG" + Math.floor(10000000000 + Math.random() * 90000000000);
+
+    const newPledge = new PledgedCollateralModel({
+      userId,
+      symbol,
+      companyName: companyName || symbol,
+      pledgedQty: numQty,
+      marketPrice: numPrice,
+      haircutPercent,
+      collateralValue,
+      status: "PLEDGED",
+      pledgeRef,
+    });
+    await newPledge.save();
+
+    // Update user funds with pledged collateral
+    const funds = await getOrCreateUserFunds(userId);
+    let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
+    let currentCollateralEquity = parseFloat((funds.equity.collateralEquity || "0").replace(/,/g, "")) || 0;
+    let currentTotalCollateral = parseFloat((funds.equity.totalCollateral || "0").replace(/,/g, "")) || 0;
+
+    currentAvailable += collateralValue;
+    currentCollateralEquity += collateralValue;
+    currentTotalCollateral += collateralValue;
+
+    funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
+    funds.equity.collateralEquity = formatIndianCurrency(currentCollateralEquity);
+    funds.equity.totalCollateral = formatIndianCurrency(currentTotalCollateral);
+    await funds.save();
+
+    // Record in ledger
+    const newTx = new FundsTransactionModel({
+      userId,
+      type: "PLEDGE_MARGIN",
+      amount: collateralValue,
+      paymentMethod: "COLLATERAL",
+      status: "COMPLETED",
+      referenceId: pledgeRef,
+      remarks: `Pledged ${numQty} sh of ${symbol} (${haircutPercent}% haircut)`,
+      completedAt: new Date(),
+    });
+    await newTx.save();
+
+    try {
+      await createNotification({
+        userId,
+        type: "FUNDS",
+        category: "MARGIN_PLEDGE",
+        title: `Margin Pledged - ${symbol}`,
+        description: `Pledged ${numQty} shares of ${symbol}. Generated ₹${formatIndianCurrency(collateralValue)} trading collateral (Haircut: ${haircutPercent}%). Ref: ${pledgeRef}.`,
+        metadata: {
+          symbol,
+          amount: collateralValue,
+          actionUrl: "/funds",
+        },
+      });
+    } catch (e) {}
+
+    res.status(201).json({
+      success: true,
+      message: `Successfully pledged ${numQty} shares of ${symbol}! ₹${formatIndianCurrency(collateralValue)} added to available margin.`,
+      pledge: newPledge,
+      collateralValue: newPledge.collateralValue,
       funds: funds.equity,
     });
-  } catch (err) {
-    console.error("Add funds error:", err);
-    res.status(500).json({ success: false, message: "Failed to add funds" });
+  } catch (error) {
+    console.error("Error pledging holding:", error);
+    res.status(500).json({ success: false, message: "Failed to pledge shares for margin." });
+  }
+});
+
+// 6. Unpledge Holding
+app.post("/unpledgeHolding", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.body.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "User authentication required" });
+    }
+
+    const { pledgeId } = req.body;
+    const pledge = await PledgedCollateralModel.findOne({ _id: pledgeId, userId, status: "PLEDGED" });
+    if (!pledge) {
+      return res.status(404).json({ success: false, message: "Active pledged record not found." });
+    }
+
+    const funds = await getOrCreateUserFunds(userId);
+    let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
+    let currentCollateralEquity = parseFloat((funds.equity.collateralEquity || "0").replace(/,/g, "")) || 0;
+    let currentTotalCollateral = parseFloat((funds.equity.totalCollateral || "0").replace(/,/g, "")) || 0;
+
+    if (currentAvailable < pledge.collateralValue) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot unpledge! You have open positions utilizing this collateral. Free up at least ₹${formatIndianCurrency(pledge.collateralValue)} margin before unpledging.`,
+      });
+    }
+
+    pledge.status = "RELEASED";
+    pledge.releasedAt = new Date();
+    await pledge.save();
+
+    currentAvailable -= pledge.collateralValue;
+    currentCollateralEquity = Math.max(0, currentCollateralEquity - pledge.collateralValue);
+    currentTotalCollateral = Math.max(0, currentTotalCollateral - pledge.collateralValue);
+
+    funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
+    funds.equity.collateralEquity = formatIndianCurrency(currentCollateralEquity);
+    funds.equity.totalCollateral = formatIndianCurrency(currentTotalCollateral);
+    await funds.save();
+
+    const unpledgeRef = "UNPLG" + Math.floor(10000000000 + Math.random() * 90000000000);
+    const newTx = new FundsTransactionModel({
+      userId,
+      type: "UNPLEDGE_MARGIN",
+      amount: pledge.collateralValue,
+      paymentMethod: "COLLATERAL",
+      status: "COMPLETED",
+      referenceId: unpledgeRef,
+      remarks: `Unpledged ${pledge.pledgedQty} sh of ${pledge.symbol}`,
+      completedAt: new Date(),
+    });
+    await newTx.save();
+
+    res.status(200).json({
+      success: true,
+      message: `Successfully unpledged ${pledge.pledgedQty} shares of ${pledge.symbol}! Demat lock released.`,
+      funds: funds.equity,
+    });
+  } catch (error) {
+    console.error("Error unpledging holding:", error);
+    res.status(500).json({ success: false, message: "Failed to unpledge shares." });
+  }
+});
+
+// 7. Get User's Pledged Holdings
+app.get("/myPledgedHoldings", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req) || req.query.userId;
+    if (!userId) return res.status(200).json([]);
+    const pledges = await PledgedCollateralModel.find({ userId, status: "PLEDGED" }).sort({ pledgedAt: -1 });
+    res.status(200).json(pledges);
+  } catch (error) {
+    res.status(500).json({ error: "Failed to fetch pledged holdings" });
   }
 });
 
@@ -2546,8 +3282,8 @@ app.post("/applyIpo", async (req, res) => {
 
     const savedApp = await newApplication.save();
 
-    const approveUrl = `http://localhost:3002/ipoMandate/action?token=${mandateToken}&decision=APPROVE`;
-    const declineUrl = `http://localhost:3002/ipoMandate/action?token=${mandateToken}&decision=REJECT`;
+    const approveUrl = `${PUBLIC_BACKEND_URL}/ipoMandate/action?token=${mandateToken}&decision=APPROVE`;
+    const declineUrl = `${PUBLIC_BACKEND_URL}/ipoMandate/action?token=${mandateToken}&decision=REJECT`;
 
     // Send real interactive email
     await sendIpoMandateEmail({
@@ -2624,7 +3360,7 @@ app.get("/ipoMandate/action", async (req, res) => {
         <body>
           <h2 style="color: #ef4444;">Mandate Link Invalid or Expired</h2>
           <p>We could not find an active IPO mandate associated with this authorization link.</p>
-          <a href="http://localhost:3001/bids" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">Return to Zerodha Kite</a>
+          <a href="${PUBLIC_FRONTEND_URL}/bids" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">Return to Zerodha Kite</a>
         </body>
         </html>
       `);
@@ -2638,7 +3374,7 @@ app.get("/ipoMandate/action", async (req, res) => {
         <body>
           <h2>Mandate Already Processed</h2>
           <p>This mandate for <strong>${application.companyName}</strong> has already been marked as <strong>${application.mandateStatus}</strong>.</p>
-          <a href="http://localhost:3001/bids" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">View in Zerodha Kite</a>
+          <a href="${PUBLIC_FRONTEND_URL}/bids" style="display: inline-block; margin-top: 16px; padding: 10px 20px; background: #387ed1; color: #fff; text-decoration: none; border-radius: 4px;">View in Zerodha Kite</a>
         </body>
         </html>
       `);
@@ -2699,7 +3435,7 @@ app.get("/ipoMandate/action", async (req, res) => {
               <tr><td class="label">UPI ID</td><td class="val">${application.upiId}</td></tr>
               <tr><td class="label">Status</td><td class="val" style="color: #16a34a;">Lien Marked (Active)</td></tr>
             </table>
-            <a href="http://localhost:3001/bids" class="btn-return">View in Zerodha Kite Dashboard &rsaquo;</a>
+            <a href="${PUBLIC_FRONTEND_URL}/bids" class="btn-return">View in Zerodha Kite Dashboard &rsaquo;</a>
           </div>
         </body>
         </html>
@@ -2744,7 +3480,7 @@ app.get("/ipoMandate/action", async (req, res) => {
             <div class="decline-icon">✕</div>
             <h2>UPI Mandate Declined</h2>
             <p>You have declined the UPI mandate for <strong>${application.companyName}</strong>. No funds have been blocked and your application has been cancelled.</p>
-            <a href="http://localhost:3001/bids" class="btn-return">Return to Dashboard</a>
+            <a href="${PUBLIC_FRONTEND_URL}/bids" class="btn-return">Return to Dashboard</a>
           </div>
         </body>
         </html>
@@ -2759,12 +3495,19 @@ app.get("/ipoMandate/action", async (req, res) => {
 // 4. Cancel / Revoke Submitted IPO Application
 app.delete("/cancelIpoApplication/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const appDoc = await IpoApplicationModel.findByIdAndUpdate(
-      id,
+    const appDoc = await IpoApplicationModel.findOneAndUpdate(
+      { _id: id, userId },
       { status: "CANCELLED", mandateStatus: "REJECTED" },
       { new: true }
     );
+    if (!appDoc) {
+      return res.status(404).json({ success: false, message: "IPO application not found" });
+    }
     if (appDoc) {
       try {
         await createNotification({
@@ -2786,10 +3529,14 @@ app.delete("/cancelIpoApplication/:id", async (req, res) => {
 // 5. Modify Existing IPO Bid (Lots / Price / Cut-off / UPI)
 app.put("/modifyIpoBid/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
     const { lots, bidPrice, isCutOff, upiId } = req.body;
 
-    const appDoc = await IpoApplicationModel.findById(id);
+    const appDoc = await IpoApplicationModel.findOne({ _id: id, userId });
     if (!appDoc) {
       return res.status(404).json({ success: false, message: "IPO application not found." });
     }
@@ -3694,8 +4441,12 @@ app.post("/createSip", async (req, res) => {
 // 3. Toggle Status (Active / Paused)
 app.patch("/toggleSipStatus/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const sip = await SipModel.findById(id);
+    const sip = await SipModel.findOne({ _id: id, userId });
     if (!sip) return res.status(404).json({ success: false, message: "SIP not found" });
 
     sip.status = sip.status === "ACTIVE" ? "PAUSED" : "ACTIVE";
@@ -3724,12 +4475,16 @@ app.patch("/toggleSipStatus/:id", async (req, res) => {
 // 3b. Rename SIP Endpoint
 app.patch("/updateSipName/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
     const { name } = req.body;
     if (!name || !name.trim()) {
       return res.status(400).json({ success: false, message: "Valid SIP name is required." });
     }
-    const sip = await SipModel.findById(id);
+    const sip = await SipModel.findOne({ _id: id, userId });
     if (!sip) return res.status(404).json({ success: false, message: "SIP not found." });
 
     const oldName = sip.name;
@@ -3899,7 +4654,15 @@ async function executeSipInternal(sipId) {
 // 5. Route to trigger SIP immediately (Option 1 - Interactive Pro Mode)
 app.post("/executeSipNow/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
+    const ownedSip = await SipModel.findOne({ _id: id, userId });
+    if (!ownedSip) {
+      return res.status(404).json({ success: false, message: "SIP not found" });
+    }
     const result = await executeSipInternal(id);
     if (!result.success) {
       return res.status(400).json(result);
@@ -3914,20 +4677,25 @@ app.post("/executeSipNow/:id", async (req, res) => {
 // 6. Delete SIP
 app.delete("/deleteSip/:id", async (req, res) => {
   try {
-    const { id } = req.params;
-    const deleted = await SipModel.findByIdAndDelete(id);
-    if (deleted) {
-      try {
-        await createNotification({
-          userId: deleted.userId,
-          type: "ORDER",
-          category: "EXECUTION",
-          title: `SIP Deleted - ${deleted.name}`,
-          description: `Stock SIP "${deleted.name}" has been permanently cancelled.`,
-          metadata: { actionUrl: "/orders" },
-        });
-      } catch (e) {}
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
     }
+    const { id } = req.params;
+    const deleted = await SipModel.findOneAndDelete({ _id: id, userId });
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "SIP not found" });
+    }
+    try {
+      await createNotification({
+        userId: deleted.userId,
+        type: "ORDER",
+        category: "EXECUTION",
+        title: `SIP Deleted - ${deleted.name}`,
+        description: `Stock SIP "${deleted.name}" has been permanently cancelled.`,
+        metadata: { actionUrl: "/orders" },
+      });
+    } catch (e) {}
     res.status(200).json({ success: true, message: "SIP deleted successfully" });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to delete SIP" });
@@ -4073,10 +4841,14 @@ app.post("/createAlert", async (req, res) => {
 // 3. Update Price Alert
 app.put("/updateAlert/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
     const { conditionType, targetPrice, targetPercentage, notes } = req.body;
 
-    const alert = await AlertModel.findById(id);
+    const alert = await AlertModel.findOne({ _id: id, userId });
     if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
 
     if (conditionType) alert.conditionType = conditionType;
@@ -4095,8 +4867,12 @@ app.put("/updateAlert/:id", async (req, res) => {
 // 4. Toggle Status (Active <-> Disabled)
 app.patch("/toggleAlertStatus/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const alert = await AlertModel.findById(id);
+    const alert = await AlertModel.findOne({ _id: id, userId });
     if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
 
     alert.status = alert.status === "ACTIVE" ? "DISABLED" : "ACTIVE";
@@ -4112,8 +4888,12 @@ app.patch("/toggleAlertStatus/:id", async (req, res) => {
 // 5. Reset Triggered Alert back to Active
 app.post("/resetAlert/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const alert = await AlertModel.findById(id);
+    const alert = await AlertModel.findOne({ _id: id, userId });
     if (!alert) return res.status(404).json({ success: false, message: "Alert not found" });
 
     alert.status = "ACTIVE";
@@ -4131,8 +4911,13 @@ app.post("/resetAlert/:id", async (req, res) => {
 // 6. Delete Alert
 app.delete("/deleteAlert/:id", async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
     const { id } = req.params;
-    const deleted = await AlertModel.findByIdAndDelete(id);
+    const deleted = await AlertModel.findOneAndDelete({ _id: id, userId });
+    if (!deleted) return res.status(404).json({ success: false, message: "Alert not found" });
     if (deleted) {
       try {
         await createNotification({
@@ -4681,6 +5466,129 @@ app.post("/cdsl/verify-otp", async (req, res) => {
   }
 });
 
+
+// ==========================================
+// SUPPORT TICKET ECOSYSTEM
+// ==========================================
+
+// 1. Register New Support Ticket
+app.post("/createSupportTicket", tradeFundsLimiter, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const {
+      userName = "Trader",
+      userEmail = "",
+      category = "ORDERS",
+      categoryLabel,
+      subject,
+      description,
+      priority = "NORMAL",
+    } = req.body;
+
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+    if (!subject || !subject.trim()) {
+      return res.status(400).json({ success: false, message: "Subject is required" });
+    }
+    if (!description || !description.trim()) {
+      return res.status(400).json({ success: false, message: "Description is required" });
+    }
+
+    const categoryLabels = {
+      FUNDS: "Funds, Payouts & Margins",
+      ORDERS: "Order Placement & Fills",
+      DEMAT: "Demat, Pledging & Holdings",
+      ACCOUNT: "Account Settings & KYC",
+      TECH: "Technical & Platform Query",
+      OTHER: "General Support Inquiry",
+    };
+
+    const finalCategoryLabel = categoryLabel || categoryLabels[category] || "General Support Inquiry";
+    const randomNum = Math.floor(100000 + Math.random() * 900000);
+    const ticketId = `TKT-${randomNum}`;
+
+    const newTicket = new SupportTicketModel({
+      ticketId,
+      userId,
+      userName,
+      userEmail,
+      category,
+      categoryLabel: finalCategoryLabel,
+      subject: subject.trim(),
+      description: description.trim(),
+      priority,
+      status: "OPEN",
+      slaHours: priority === "URGENT" ? 1 : 2,
+      assignedTo: "Kite Customer Helpdesk",
+      createdAt: new Date(),
+    });
+
+    await newTicket.save();
+
+    // Trigger in-app notification for the user
+    try {
+      await createNotification({
+        userId,
+        type: "SYSTEM",
+        category: "SUPPORT_TICKET",
+        title: `Support Ticket #${ticketId} Registered`,
+        description: `Your ticket regarding '${subject.trim()}' has been registered under ${finalCategoryLabel}. Priority: ${priority}. Expected SLA: 2 business hours.`,
+        metadata: {
+          referenceId: ticketId,
+          actionUrl: "/support",
+        },
+        priority: priority === "URGENT" ? "HIGH" : "NORMAL",
+      });
+    } catch (notifErr) {
+      console.warn("Could not dispatch ticket notification:", notifErr.message);
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: `Support Ticket #${ticketId} created successfully. Our team will resolve it within 2 business hours.`,
+      ticket: newTicket,
+    });
+  } catch (err) {
+    console.error("Error creating support ticket:", err);
+    return res.status(500).json({ success: false, message: "Failed to create support ticket" });
+  }
+});
+
+// 2. Fetch User's Registered Support Tickets
+app.get("/mySupportTickets", async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    if (!userId) {
+      return res.status(401).json({ success: false, message: "Authentication required" });
+    }
+
+    const tickets = await SupportTicketModel.find({ userId }).sort({ createdAt: -1 });
+    return res.status(200).json({
+      success: true,
+      count: tickets.length,
+      tickets,
+    });
+  } catch (err) {
+    console.error("Error fetching support tickets:", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch support tickets" });
+  }
+});
+
+// Global Error Handler (prevents stack trace leakage in production)
+app.use((err, req, res, next) => {
+  console.error("Unhandled Express Error:", err?.message || err);
+  if (err && err.type === "entity.parse.failed") {
+    return res.status(400).json({ success: false, message: "Malformed JSON payload" });
+  }
+  if (err && typeof err.message === "string" && err.message.startsWith("CORS origin blocked")) {
+    return res.status(403).json({ success: false, message: "Origin not allowed by CORS policy" });
+  }
+  return res.status(err?.status || 500).json({
+    success: false,
+    message: process.env.NODE_ENV === "production" ? "Internal server error" : err?.message || "Internal server error",
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`Backend server running on port ${PORT}!`);

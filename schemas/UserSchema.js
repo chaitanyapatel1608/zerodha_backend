@@ -49,6 +49,7 @@ const UserSchema = new Schema({
   phone: {
     type: String,
     trim: true,
+    index: true,
   },
   pan: {
     type: String,

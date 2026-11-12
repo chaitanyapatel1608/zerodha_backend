@@ -730,7 +730,151 @@ async function sendCdslTransactionOtpEmail(toEmail, otp, stockName, stockQty) {
   }
 }
 
+
+/**
+ * Interactive UPI Collect Request Email for Adding Funds
+ */
+async function sendFundDepositEmail({
+  toEmail,
+  amount,
+  upiId,
+  referenceId,
+  approveUrl,
+  declineUrl,
+}) {
+  const emailUser = process.env.EMAIL_USER;
+  const emailPass = process.env.EMAIL_PASS;
+  const formattedAmount = Number(amount).toLocaleString("en-IN", { minimumFractionDigits: 2 });
+
+  if (!emailUser || !emailPass) {
+    console.log(
+      `⚠️ [EMAIL SERVICE] EMAIL_USER / EMAIL_PASS not set. Simulated UPI deposit email for ${toEmail}: Amount ₹${formattedAmount}, Approve: ${approveUrl}`
+    );
+    return {
+      delivered: false,
+      reason: "CREDENTIALS_NOT_CONFIGURED",
+      approveUrl,
+      declineUrl,
+    };
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      service: process.env.EMAIL_SERVICE || "gmail",
+      auth: {
+        user: emailUser,
+        pass: emailPass,
+      },
+    });
+
+    const htmlContent = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f8fafc; margin: 0; padding: 24px; color: #0f172a; }
+          .container { max-width: 520px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+          .header { background: #ffffff; padding: 24px; text-align: center; border-bottom: 2px solid #16a34a; }
+          .header-brand { font-size: 22px; font-weight: 700; color: #387ed1; letter-spacing: 1px; margin: 0; }
+          .header-tag { font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: #64748b; margin-top: 4px; font-weight: 600; }
+          .content { padding: 28px 24px; }
+          .alert-banner { background: #f0fdf4; border-left: 4px solid #16a34a; padding: 12px 16px; border-radius: 4px; margin-bottom: 24px; }
+          .alert-banner p { margin: 0; font-size: 13px; color: #166534; line-height: 1.5; }
+          .summary-card { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 18px; margin-bottom: 24px; }
+          .summary-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e2e8f0; font-size: 13px; }
+          .summary-row:last-child { border-bottom: none; }
+          .summary-label { color: #64748b; }
+          .summary-value { font-weight: 600; color: #0f172a; text-align: right; }
+          .amount-highlight { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; padding: 16px; text-align: center; margin-bottom: 28px; }
+          .amount-label { font-size: 11px; text-transform: uppercase; color: #15803d; font-weight: 700; letter-spacing: 0.5px; }
+          .amount-value { font-size: 32px; font-weight: 700; color: #166534; margin: 4px 0 0 0; }
+          .action-buttons-wrap { text-align: center; margin: 28px 0 12px 0; }
+          .btn { display: inline-block; padding: 14px 28px; font-size: 14px; font-weight: 600; text-decoration: none; border-radius: 5px; margin: 6px 8px; }
+          .btn-approve { background-color: #16a34a; color: #ffffff !important; box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35); }
+          .btn-decline { background-color: #ffffff; color: #dc2626 !important; border: 1px solid #fca5a5; }
+          .info-note { font-size: 11.5px; color: #64748b; line-height: 1.5; margin-top: 20px; text-align: center; padding: 0 12px; }
+          .footer { background: #fafafa; padding: 18px 24px; font-size: 11.5px; color: #94a3b8; text-align: center; border-top: 1px solid #e2e8f0; line-height: 1.6; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1 class="header-brand">ZERODHA</h1>
+            <div class="header-tag">Instant Funds Payin &bull; UPI Collect Request</div>
+          </div>
+          <div class="content">
+            <div class="alert-banner">
+              <p>
+                <strong>Payment Authorization Required:</strong> An instant fund transfer request of <strong>₹${formattedAmount}</strong> has been initiated via UPI for your Zerodha trading account.
+              </p>
+            </div>
+
+            <div class="amount-highlight">
+              <div class="amount-label">Deposit Amount to Credit</div>
+              <div class="amount-value">₹${formattedAmount}</div>
+            </div>
+
+            <div class="summary-card">
+              <div class="summary-row">
+                <span class="summary-label">Reference ID</span>
+                <span class="summary-value" style="font-family: monospace;">${referenceId}</span>
+              </div>
+              <div class="summary-row">
+                <span class="summary-label">Target Trading Account</span>
+                <span class="summary-value">Equity & F&O Margin</span>
+              </div>
+              <div class="summary-row">
+                <span class="summary-label">Payer UPI ID</span>
+                <span class="summary-value">${upiId}</span>
+              </div>
+              <div class="summary-row">
+                <span class="summary-label">Transfer Type</span>
+                <span class="summary-value">Instant Zero-Cost UPI</span>
+              </div>
+            </div>
+
+            <div class="action-buttons-wrap">
+              <a href="${approveUrl}" class="btn btn-approve">
+                ✓ Approve Payment (₹${formattedAmount})
+              </a>
+              <a href="${declineUrl}" class="btn btn-decline">
+                ✕ Decline Transfer
+              </a>
+            </div>
+
+            <p class="info-note">
+              Once approved, funds will be instantly credited to your trading margin and available for immediate equity and intraday trading.
+            </p>
+          </div>
+
+          <div class="footer">
+            Zerodha Broking Ltd. &bull; SEBI Registration No.: INZ000031633<br>
+            If you did not initiate this deposit, click Decline to reject the transfer request immediately.
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    const info = await transporter.sendMail({
+      from: `"Zerodha Kite" <${emailUser}>`,
+      to: toEmail,
+      subject: `Action Required: Approve UPI Fund Transfer of ₹${formattedAmount} (Ref: ${referenceId})`,
+      text: `Action Required: Approve UPI Fund Transfer of ₹${formattedAmount} to your Zerodha trading account. Approve here: ${approveUrl} or Decline here: ${declineUrl}`,
+      html: htmlContent,
+    });
+
+    console.log(`✉️ [FUND DEPOSIT EMAIL SENT] Sent to ${toEmail} (Ref: ${referenceId})`);
+    return { delivered: true, messageId: info.messageId };
+  } catch (error) {
+    console.error(`❌ [FUND DEPOSIT EMAIL ERROR] Failed to send email to ${toEmail}:`, error.message);
+    return { delivered: false, reason: error.message };
+  }
+}
+
 module.exports = {
+  sendFundDepositEmail,
   sendOtpEmail,
   sendIpoMandateEmail,
   sendSipFailureEmail,
