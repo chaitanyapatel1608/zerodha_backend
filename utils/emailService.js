@@ -37,7 +37,45 @@ function sendMailWithTimeout(transporter, mailOptions, timeoutMs = 8500) {
  * 2. Fallback: Uses SMTP (Nodemailer over port 587/465) with strict 8.5s timeout.
  */
 async function sendUniversalEmail({ toEmail, subject, text, htmlContent, fromName = "Zerodha Kite" }) {
-  // 1. Resend HTTP REST API (100% reliable live delivery to account owner inbox)
+  // 1. EmailJS REST API (Sends from connected Gmail directly to ANY user's individual email address over HTTPS port 443!)
+  const emailjsServiceId = process.env.EMAILJS_SERVICE_ID;
+  const emailjsTemplateId = process.env.EMAILJS_TEMPLATE_ID;
+  const emailjsPublicKey = process.env.EMAILJS_PUBLIC_KEY;
+  const emailjsPrivateKey = process.env.EMAILJS_PRIVATE_KEY;
+
+  if (emailjsServiceId && emailjsTemplateId && emailjsPublicKey) {
+    try {
+      const res = await fetch("https://api.emailjs.com/api/v1.0/email/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          service_id: emailjsServiceId.trim(),
+          template_id: emailjsTemplateId.trim(),
+          user_id: emailjsPublicKey.trim(),
+          accessToken: (emailjsPrivateKey || "").trim(),
+          template_params: {
+            to_email: toEmail,
+            email: toEmail,
+            subject,
+            message: htmlContent || text,
+            from_name: fromName,
+          },
+        }),
+      });
+
+      if (res.ok) {
+        console.log(`✉️ [LIVE EMAILJS HTTP EMAIL DELIVERED] Sent directly to ${toEmail} (Subject: "${subject}")`);
+        return { delivered: true, messageId: `emailjs_${Date.now()}` };
+      } else {
+        const errText = await res.text();
+        console.warn(`⚠️ [EMAILJS API REJECTED] ${errText}`);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [EMAILJS FETCH FAILED] ${e.message}`);
+    }
+  }
+
+  // 2. Resend HTTP REST API Fallback
   const resendApiKey = process.env.RESEND_API_KEY;
   if (resendApiKey && resendApiKey.trim()) {
     try {
