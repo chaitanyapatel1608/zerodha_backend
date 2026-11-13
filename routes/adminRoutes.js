@@ -8,6 +8,7 @@ const {
   isValidObjectId,
   hashPassword,
   constantTimeEquals,
+  parseCookies,
 } = require("../utils/security");
 const { sendOtpEmail } = require("../utils/emailService");
 const { decryptField } = require("../utils/encryption");
@@ -220,9 +221,23 @@ router.use(requireAuth, requireAdmin);
 
 // 1. Admin Identity
 router.get("/me", (req, res) => {
+  const cookies = parseCookies(req.headers?.cookie || "");
+  let csrfToken = cookies.zerodha_csrf || "";
+  if (!csrfToken) {
+    csrfToken = crypto.randomBytes(32).toString("hex");
+    const isSecure = process.env.NODE_ENV === "production" || Boolean(req?.secure) || req?.headers?.["x-forwarded-proto"] === "https";
+    res.cookie("zerodha_csrf", csrfToken, {
+      httpOnly: false,
+      secure: isSecure,
+      sameSite: isSecure ? "none" : "lax",
+      path: "/",
+      maxAge: 24 * 60 * 60 * 1000,
+    });
+  }
   return res.json({
     success: true,
     admin: req.adminUser,
+    csrfToken,
   });
 });
 
