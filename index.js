@@ -124,7 +124,7 @@ function buildCookieOptions(req, httpOnly) {
   const opts = {
     httpOnly,
     secure: isSecure,
-    sameSite: "lax",
+    sameSite: isSecure ? "none" : "lax",
     path: "/",
     maxAge: 24 * 60 * 60 * 1000,
   };
