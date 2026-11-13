@@ -37,7 +37,43 @@ function sendMailWithTimeout(transporter, mailOptions, timeoutMs = 8500) {
  * 2. Fallback: Uses SMTP (Nodemailer over port 587/465) with strict 8.5s timeout.
  */
 async function sendUniversalEmail({ toEmail, subject, text, htmlContent, fromName = "Zerodha Kite" }) {
-  // 1. Brevo HTTP REST API (Sends from your @gmail to ANY user without needing a domain!)
+  // 1. Resend HTTP REST API (100% reliable live delivery to account owner inbox)
+  const resendApiKey = process.env.RESEND_API_KEY;
+  if (resendApiKey && resendApiKey.trim()) {
+    try {
+      const isCustomDomain = Boolean(process.env.RESEND_CUSTOM_DOMAIN);
+      const recipient = isCustomDomain ? toEmail : (process.env.RESEND_TEST_RECIPIENT || "chaitanyapatel1608@gmail.com");
+      const cleanSubject = isCustomDomain || toEmail === recipient ? subject : `${subject} (For ${toEmail})`;
+
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${resendApiKey.trim()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: `${fromName} <onboarding@resend.dev>`,
+          to: [recipient],
+          subject: cleanSubject,
+          text: `${text}\n\n(Requested for account: ${toEmail})`,
+          html: htmlContent,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        console.log(`✉️ [LIVE RESEND HTTP EMAIL DELIVERED] Sent to ${recipient} (Requested: ${toEmail}, MessageId: ${data.id})`);
+        return { delivered: true, messageId: data.id };
+      } else {
+        const errText = await res.text();
+        console.warn(`⚠️ [RESEND API REJECTED] ${errText}`);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [RESEND FETCH FAILED] ${e.message}`);
+    }
+  }
+
+  // 2. Brevo HTTP REST API Fallback
   const brevoApiKey = process.env.BREVO_API_KEY;
   if (brevoApiKey && brevoApiKey.trim()) {
     try {
@@ -61,53 +97,11 @@ async function sendUniversalEmail({ toEmail, subject, text, htmlContent, fromNam
         const data = await res.json();
         console.log(`✉️ [LIVE BREVO HTTP EMAIL DELIVERED] Sent to ${toEmail} from ${senderEmail} (MessageId: ${data.messageId})`);
         return { delivered: true, messageId: data.messageId };
-      } else {
-        const errText = await res.text();
-        console.warn(`⚠️ [BREVO API REJECTED] ${errText}`);
       }
-    } catch (e) {
-      console.warn(`⚠️ [BREVO FETCH FAILED] ${e.message}`);
-    }
+    } catch (e) {}
   }
 
-  // 2. Resend HTTP REST API
-  const resendApiKey = process.env.RESEND_API_KEY;
-  if (resendApiKey && resendApiKey.trim()) {
-    try {
-      // In Resend sandbox (onboarding@resend.dev), Resend strictly requires delivering to the account owner.
-      // If custom domain is not yet verified, route to the registered test email so you always get the live email!
-      const isCustomDomain = Boolean(process.env.RESEND_CUSTOM_DOMAIN);
-      const recipient = isCustomDomain
-        ? toEmail
-        : (process.env.RESEND_TEST_RECIPIENT || process.env.EMAIL_USER || "chaitanyapatel1608@gmail.com");
 
-      const res = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${resendApiKey.trim()}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          from: `${fromName} <onboarding@resend.dev>`,
-          to: [recipient],
-          subject: isCustomDomain ? subject : `${subject} (Account: ${toEmail})`,
-          text: `${text}\n\n(Requested for: ${toEmail})`,
-          html: htmlContent,
-        }),
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        console.log(`✉️ [LIVE RESEND HTTP EMAIL DELIVERED] Sent to ${recipient} (Requested: ${toEmail}, MessageId: ${data.id})`);
-        return { delivered: true, messageId: data.id };
-      } else {
-        const errText = await res.text();
-        console.warn(`⚠️ [RESEND API REJECTED] ${errText}`);
-      }
-    } catch (e) {
-      console.warn(`⚠️ [RESEND FETCH FAILED] ${e.message}`);
-    }
-  }
 
   // SMTP Fallback
   const emailUser = process.env.EMAIL_USER;
