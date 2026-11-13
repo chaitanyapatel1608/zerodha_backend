@@ -22,6 +22,7 @@ const {
   constantTimeEquals,
   escapeRegex,
   isValidObjectId,
+  parseCookies,
 } = require("./utils/security");
 const { getAuthenticatedUserId, requireAuth } = require("./middleware/auth");
 const { otpLimiter, authLimiter, tradeFundsLimiter, catalogLimiter } = require("./middleware/rateLimiters");
@@ -555,14 +556,19 @@ app.post("/kite-login", authLimiter, async (req, res) => {
 
 // 2b. CSRF Token Endpoint for cross-domain SPA clients
 app.get("/csrf-token", (req, res) => {
-  const cookies = parseCookies(req.headers?.cookie || "");
-  let csrfToken = cookies.zerodha_csrf;
-  if (!csrfToken) {
-    csrfToken = crypto.randomBytes(32).toString("hex");
-    res.cookie("zerodha_csrf", csrfToken, buildCookieOptions(req, false));
+  try {
+    const cookies = parseCookies(req.headers?.cookie || "");
+    let csrfToken = cookies.zerodha_csrf;
+    if (!csrfToken) {
+      csrfToken = crypto.randomBytes(32).toString("hex");
+      res.cookie("zerodha_csrf", csrfToken, buildCookieOptions(req, false));
+    }
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).json({ success: true, csrfToken });
+  } catch (err) {
+    logger.error("csrf_token_error", { message: err?.message });
+    return res.status(500).json({ success: false, message: "Error issuing CSRF token" });
   }
-  res.setHeader("Cache-Control", "no-store");
-  return res.status(200).json({ success: true, csrfToken });
 });
 
 // 3. Verify Active Session Token
