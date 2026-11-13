@@ -672,7 +672,9 @@ async function sendCdslTpinEmail(toEmail, tpin, dematBoId) {
   const emailUser = process.env.EMAIL_USER;
   const emailPass = process.env.EMAIL_PASS;
 
-  if (!emailUser || !emailPass) {
+  const brevoApiKey = process.env.BREVO_API_KEY;
+  const resendApiKey = process.env.RESEND_API_KEY;
+  if (!brevoApiKey && !resendApiKey && (!emailUser || !emailPass)) {
     console.warn("[EMAIL SERVICE] SMTP credentials not configured; CDSL TPIN delivery skipped.");
     return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
   }
@@ -725,16 +727,19 @@ async function sendCdslTpinEmail(toEmail, tpin, dematBoId) {
       </html>
     `;
 
-    const info = await transporter.sendMail({
-      from: `"CDSL E-DIS Depository" <${emailUser}>`,
-      to: toEmail,
+    const res = await sendUniversalEmail({
+      toEmail,
       subject: `🔐 Your CDSL Demat E-DIS TPIN: ${tpin} (BO ID: ${dematBoId || "12081600..."})`,
       text: `Your CDSL Demat TPIN for E-DIS authorization is: ${tpin}. BO ID: ${dematBoId}`,
-      html: htmlContent,
+      htmlContent,
+      fromName: "CDSL E-DIS Depository",
     });
-
-    console.log(`✉️ [CDSL TPIN EMAIL SENT] Sent to ${toEmail} (MessageId: ${info.messageId})`);
-    return { delivered: true, messageId: info.messageId };
+    if (res.delivered) {
+      console.log(`✉️ [CDSL TPIN EMAIL SENT] Sent to ${toEmail} (MessageId: ${res.messageId})`);
+    } else {
+      console.error(`❌ [CDSL TPIN EMAIL ERROR] Failed to send email to ${toEmail}:`, res.reason || "");
+    }
+    return res;
   } catch (error) {
     console.error(`❌ [CDSL TPIN EMAIL ERROR] Failed to send email to ${toEmail}:`, error.message);
     return { delivered: false, reason: error.message };
@@ -748,7 +753,9 @@ async function sendCdslTransactionOtpEmail(toEmail, otp, stockName, stockQty) {
   const emailUser = process.env.EMAIL_USER;
   const emailPass = process.env.EMAIL_PASS;
 
-  if (!emailUser || !emailPass) {
+  const brevoApiKey = process.env.BREVO_API_KEY;
+  const resendApiKey = process.env.RESEND_API_KEY;
+  if (!brevoApiKey && !resendApiKey && (!emailUser || !emailPass)) {
     console.warn("[EMAIL SERVICE] SMTP credentials not configured; CDSL OTP delivery skipped.");
     return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
   }
@@ -803,16 +810,19 @@ async function sendCdslTransactionOtpEmail(toEmail, otp, stockName, stockQty) {
       </html>
     `;
 
-    const info = await transporter.sendMail({
-      from: `"CDSL E-DIS Depository" <${emailUser}>`,
-      to: toEmail,
+    const res = await sendUniversalEmail({
+      toEmail,
       subject: `🔐 CDSL E-DIS Transaction OTP: ${otp} for ${stockName || "Shares"} Sale`,
       text: `Your CDSL Transaction OTP is: ${otp}. Valid for ${stockQty} shares of ${stockName}.`,
-      html: htmlContent,
+      htmlContent,
+      fromName: "CDSL E-DIS Depository",
     });
-
-    console.log(`✉️ [CDSL OTP EMAIL SENT] Sent to ${toEmail} (MessageId: ${info.messageId})`);
-    return { delivered: true, messageId: info.messageId };
+    if (res.delivered) {
+      console.log(`✉️ [CDSL OTP EMAIL SENT] Sent to ${toEmail} (MessageId: ${res.messageId})`);
+    } else {
+      console.error(`❌ [CDSL OTP EMAIL ERROR] Failed to send email to ${toEmail}:`, res.reason || "");
+    }
+    return res;
   } catch (error) {
     console.error(`❌ [CDSL OTP EMAIL ERROR] Failed to send email to ${toEmail}:`, error.message);
     return { delivered: false, reason: error.message };
