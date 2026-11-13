@@ -37,6 +37,40 @@ function sendMailWithTimeout(transporter, mailOptions, timeoutMs = 8500) {
  * 2. Fallback: Uses SMTP (Nodemailer over port 587/465) with strict 8.5s timeout.
  */
 async function sendUniversalEmail({ toEmail, subject, text, htmlContent, fromName = "Zerodha Kite" }) {
+  // 1. Brevo HTTP REST API (Sends from your @gmail to ANY user without needing a domain!)
+  const brevoApiKey = process.env.BREVO_API_KEY;
+  if (brevoApiKey && brevoApiKey.trim()) {
+    try {
+      const senderEmail = process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_USER || "chaitanyapatel1608@gmail.com";
+      const res = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: {
+          "api-key": brevoApiKey.trim(),
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: JSON.stringify({
+          sender: { name: fromName, email: senderEmail },
+          to: [{ email: toEmail }],
+          subject,
+          htmlContent,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        console.log(`✉️ [LIVE BREVO HTTP EMAIL DELIVERED] Sent to ${toEmail} from ${senderEmail} (MessageId: ${data.messageId})`);
+        return { delivered: true, messageId: data.messageId };
+      } else {
+        const errText = await res.text();
+        console.warn(`⚠️ [BREVO API REJECTED] ${errText}`);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [BREVO FETCH FAILED] ${e.message}`);
+    }
+  }
+
+  // 2. Resend HTTP REST API
   const resendApiKey = process.env.RESEND_API_KEY;
   if (resendApiKey && resendApiKey.trim()) {
     try {
