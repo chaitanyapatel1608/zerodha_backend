@@ -40,6 +40,13 @@ async function sendUniversalEmail({ toEmail, subject, text, htmlContent, fromNam
   const resendApiKey = process.env.RESEND_API_KEY;
   if (resendApiKey && resendApiKey.trim()) {
     try {
+      // In Resend sandbox (onboarding@resend.dev), Resend strictly requires delivering to the account owner.
+      // If custom domain is not yet verified, route to the registered test email so you always get the live email!
+      const isCustomDomain = Boolean(process.env.RESEND_CUSTOM_DOMAIN);
+      const recipient = isCustomDomain
+        ? toEmail
+        : (process.env.RESEND_TEST_RECIPIENT || process.env.EMAIL_USER || "chaitanyapatel1608@gmail.com");
+
       const res = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: {
@@ -48,16 +55,16 @@ async function sendUniversalEmail({ toEmail, subject, text, htmlContent, fromNam
         },
         body: JSON.stringify({
           from: `${fromName} <onboarding@resend.dev>`,
-          to: [toEmail],
-          subject,
-          text,
+          to: [recipient],
+          subject: isCustomDomain ? subject : `${subject} (Account: ${toEmail})`,
+          text: `${text}\n\n(Requested for: ${toEmail})`,
           html: htmlContent,
         }),
       });
 
       if (res.ok) {
         const data = await res.json();
-        console.log(`✉️ [LIVE RESEND HTTP EMAIL DELIVERED] Sent to ${toEmail} (MessageId: ${data.id})`);
+        console.log(`✉️ [LIVE RESEND HTTP EMAIL DELIVERED] Sent to ${recipient} (Requested: ${toEmail}, MessageId: ${data.id})`);
         return { delivered: true, messageId: data.id };
       } else {
         const errText = await res.text();
