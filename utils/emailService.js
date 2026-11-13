@@ -729,10 +729,10 @@ async function sendCdslTpinEmail(toEmail, tpin, dematBoId) {
 
     const res = await sendUniversalEmail({
       toEmail,
-      subject: `🔐 Your CDSL Demat E-DIS TPIN: ${tpin} (BO ID: ${dematBoId || "12081600..."})`,
+      subject: `${tpin} is your Zerodha CDSL Demat TPIN`,
       text: `Your CDSL Demat TPIN for E-DIS authorization is: ${tpin}. BO ID: ${dematBoId}`,
       htmlContent,
-      fromName: "CDSL E-DIS Depository",
+      fromName: "Zerodha Kite",
     });
     if (res.delivered) {
       console.log(`✉️ [CDSL TPIN EMAIL SENT] Sent to ${toEmail} (MessageId: ${res.messageId})`);
@@ -812,10 +812,10 @@ async function sendCdslTransactionOtpEmail(toEmail, otp, stockName, stockQty) {
 
     const res = await sendUniversalEmail({
       toEmail,
-      subject: `🔐 CDSL E-DIS Transaction OTP: ${otp} for ${stockName || "Shares"} Sale`,
+      subject: `${otp} is your Zerodha CDSL transaction OTP`,
       text: `Your CDSL Transaction OTP is: ${otp}. Valid for ${stockQty} shares of ${stockName}.`,
       htmlContent,
-      fromName: "CDSL E-DIS Depository",
+      fromName: "Zerodha Kite",
     });
     if (res.delivered) {
       console.log(`✉️ [CDSL OTP EMAIL SENT] Sent to ${toEmail} (MessageId: ${res.messageId})`);

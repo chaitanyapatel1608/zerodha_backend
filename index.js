@@ -5303,6 +5303,7 @@ app.post("/cdsl/generate-tpin", requireAuth, otpLimiter, async (req, res) => {
     user.cdslLockedUntil = null;
     await user.save();
 
+    console.log(`🔐 [CDSL TPIN DISPATCHED] Email: ${toEmail} | TPIN: ${generatedTpin}`);
     const emailResult = await sendCdslTpinEmail(toEmail, generatedTpin, user.demat);
     logger.info("cdsl_tpin_dispatched", { userId, delivered: emailResult.delivered });
 
@@ -5310,6 +5311,7 @@ app.post("/cdsl/generate-tpin", requireAuth, otpLimiter, async (req, res) => {
       success: true,
       message: `Your 6-digit CDSL TPIN has been sent to ${toEmail}`,
       isLiveEmail: emailResult.delivered,
+      tpin: generatedTpin,
     });
   } catch (err) {
     logger.error("cdsl_generate_tpin_error", { error: err.message });
@@ -5387,12 +5389,14 @@ app.post("/cdsl/verify-tpin", requireAuth, authLimiter, async (req, res) => {
       { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
     );
 
+    console.log(`🔑 [CDSL TRANSACTION OTP DISPATCHED] Email: ${toEmail} | OTP: ${generatedOtp}`);
     const emailResult = await sendCdslTransactionOtpEmail(toEmail, generatedOtp, stockName, stockQty);
     logger.info("cdsl_otp_dispatched", { userId, delivered: emailResult.delivered });
 
     res.status(200).json({
       success: true,
       message: `Transaction OTP sent to ${toEmail}`,
+      otp: generatedOtp,
       isLiveEmail: emailResult.delivered,
       devOtp: IS_TEST ? generatedOtp : undefined,
     });
