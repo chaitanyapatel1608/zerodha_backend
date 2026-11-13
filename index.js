@@ -282,6 +282,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
 
     // Dispatch live email via Nodemailer
     const emailResult = await sendOtpEmail(normalizedEmail, generatedOtp);
+    console.log(`🔑 [LOGIN OTP DISPATCHED] Email: ${normalizedEmail} | OTP: ${generatedOtp} | Email Delivered: ${emailResult.delivered}`);
 
     return res.status(200).json({
       success: true,

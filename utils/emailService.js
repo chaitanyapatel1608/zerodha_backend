@@ -1,5 +1,30 @@
 const nodemailer = require("nodemailer");
 
+function createMailTransporter() {
+  const emailUser = process.env.EMAIL_USER;
+  const emailPass = process.env.EMAIL_PASS;
+  if (!emailUser || !emailPass) return null;
+
+  return nodemailer.createTransport({
+    service: process.env.EMAIL_SERVICE || "gmail",
+    auth: {
+      user: emailUser,
+      pass: emailPass,
+    },
+    connectionTimeout: 4000,
+    greetingTimeout: 4000,
+    socketTimeout: 4000,
+  });
+}
+
+function sendMailWithTimeout(transporter, mailOptions, timeoutMs = 4500) {
+  const sendPromise = transporter.sendMail(mailOptions);
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error("SMTP_CONNECTION_TIMEOUT")), timeoutMs)
+  );
+  return Promise.race([sendPromise, timeoutPromise]);
+}
+
 /**
  * Sends a branded Zerodha Kite OTP email to the user.
  * Supports Gmail App Passwords, Custom SMTP, or falls back gracefully to console delivery.
@@ -17,13 +42,10 @@ async function sendOtpEmail(toEmail, otp) {
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: {
-        user: emailUser,
-        pass: emailPass,
-      },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) {
+      return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
+    }
 
     const htmlContent = `
       <!DOCTYPE html>
@@ -63,13 +85,13 @@ async function sendOtpEmail(toEmail, otp) {
       </html>
     `;
 
-    const info = await transporter.sendMail({
+    const info = await sendMailWithTimeout(transporter, {
       from: `"Zerodha Kite" <${emailUser}>`,
       to: toEmail,
       subject: `${otp} is your Zerodha verification code`,
       text: `Your Zerodha verification code is ${otp}. Valid for 5 minutes.`,
       html: htmlContent,
-    });
+    }, 4500);
 
     console.log(`✉️ [LIVE EMAIL DELIVERED] OTP sent to ${toEmail} (MessageId: ${info.messageId})`);
     return {
@@ -77,7 +99,7 @@ async function sendOtpEmail(toEmail, otp) {
       messageId: info.messageId,
     };
   } catch (error) {
-    console.error(`❌ [EMAIL DELIVERY FAILED] Could not send email to ${toEmail}:`, error.message);
+    console.warn(`⚠️ [EMAIL DELIVERY NOTE] Could not deliver email to ${toEmail}: ${error.message}`);
     return {
       delivered: false,
       reason: error.message,
@@ -120,13 +142,10 @@ async function sendIpoMandateEmail({
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: {
-        user: emailUser,
-        pass: emailPass,
-      },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) {
+      return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED", approveUrl, declineUrl };
+    }
 
     const formattedAmount = Number(totalAmount).toLocaleString("en-IN", {
       minimumFractionDigits: 2,
@@ -284,10 +303,8 @@ async function sendSipFailureEmail({
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: { user: emailUser, pass: emailPass },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
 
     const formattedReq = Number(requiredAmount).toLocaleString("en-IN", {
       minimumFractionDigits: 2,
@@ -386,10 +403,8 @@ async function sendSipSuccessEmail({
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: { user: emailUser, pass: emailPass },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
 
     const formattedAmount = Number(totalAmount).toLocaleString("en-IN", {
       minimumFractionDigits: 2,
@@ -485,13 +500,10 @@ async function sendAlertTriggeredEmail({
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: {
-        user: emailUser,
-        pass: emailPass,
-      },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) {
+      return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED", approveUrl, declineUrl };
+    }
 
     const formattedTriggeredPrice = Number(triggeredPrice).toLocaleString("en-IN", {
       minimumFractionDigits: 2,
@@ -581,10 +593,8 @@ async function sendCdslTpinEmail(toEmail, tpin, dematBoId) {
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: { user: emailUser, pass: emailPass },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
 
     const htmlContent = `
       <!DOCTYPE html>
@@ -659,10 +669,8 @@ async function sendCdslTransactionOtpEmail(toEmail, otp, stockName, stockQty) {
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: { user: emailUser, pass: emailPass },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
 
     const htmlContent = `
       <!DOCTYPE html>
@@ -755,13 +763,10 @@ async function sendFundDepositEmail({
   }
 
   try {
-    const transporter = nodemailer.createTransport({
-      service: process.env.EMAIL_SERVICE || "gmail",
-      auth: {
-        user: emailUser,
-        pass: emailPass,
-      },
-    });
+    const transporter = createMailTransporter();
+    if (!transporter) {
+      return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED", approveUrl, declineUrl };
+    }
 
     const htmlContent = `
       <!DOCTYPE html>
