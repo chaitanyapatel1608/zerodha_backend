@@ -32,85 +32,123 @@ function sendMailWithTimeout(transporter, mailOptions, timeoutMs = 8500) {
 }
 
 /**
- * Sends a branded Zerodha Kite OTP email to the user.
- * Supports Gmail App Passwords, Custom SMTP, or falls back gracefully to console delivery.
+ * Universal Email Dispatcher:
+ * 1. Primary: Uses HTTP REST API (Resend over HTTPS port 443) - NEVER blocked by cloud firewalls!
+ * 2. Fallback: Uses SMTP (Nodemailer over port 587/465) with strict 8.5s timeout.
  */
-async function sendOtpEmail(toEmail, otp) {
+async function sendUniversalEmail({ toEmail, subject, text, htmlContent, fromName = "Zerodha Kite" }) {
+  const resendApiKey = process.env.RESEND_API_KEY;
+  if (resendApiKey && resendApiKey.trim()) {
+    try {
+      const res = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${resendApiKey.trim()}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          from: `${fromName} <onboarding@resend.dev>`,
+          to: [toEmail],
+          subject,
+          text,
+          html: htmlContent,
+        }),
+      });
+
+      if (res.ok) {
+        const data = await res.json();
+        console.log(`✉️ [LIVE RESEND HTTP EMAIL DELIVERED] Sent to ${toEmail} (MessageId: ${data.id})`);
+        return { delivered: true, messageId: data.id };
+      } else {
+        const errText = await res.text();
+        console.warn(`⚠️ [RESEND API REJECTED] ${errText}`);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [RESEND FETCH FAILED] ${e.message}`);
+    }
+  }
+
+  // SMTP Fallback
   const emailUser = process.env.EMAIL_USER;
   const emailPass = process.env.EMAIL_PASS;
-
   if (!emailUser || !emailPass) {
-    console.warn("[EMAIL SERVICE] SMTP credentials not configured; OTP delivery skipped.");
-    return {
-      delivered: false,
-      reason: "CREDENTIALS_NOT_CONFIGURED",
-    };
+    return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
   }
 
   try {
     const transporter = createMailTransporter();
-    if (!transporter) {
-      return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
-    }
+    if (!transporter) return { delivered: false, reason: "CREDENTIALS_NOT_CONFIGURED" };
 
-    const htmlContent = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <style>
-          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f7f9fc; margin: 0; padding: 20px; color: #424242; }
-          .container { max-width: 500px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e0e0e0; overflow: hidden; }
-          .header { background: #ffffff; padding: 24px; text-align: center; border-bottom: 1px solid #f0f0f0; }
-          .content { padding: 32px 24px; text-align: center; }
-          .otp-box { display: inline-block; background: #f0f7ff; border: 2px dashed #387ed1; border-radius: 8px; padding: 14px 28px; font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #387ed1; margin: 24px 0; }
-          .footer { background: #fafafa; padding: 16px 24px; font-size: 12px; color: #888888; text-align: center; border-top: 1px solid #f0f0f0; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header">
-            <h2 style="color: #387ed1; margin: 0; font-weight: 700; letter-spacing: 1px;">ZERODHA</h2>
-          </div>
-          <div class="content">
-            <h3 style="margin-top: 0; color: #222;">Login / Signup Verification</h3>
-            <p style="color: #666; font-size: 14px; line-height: 1.6;">
-              Please use the verification code below to complete your login or registration on Zerodha Kite.
-            </p>
-            <div class="otp-box">${otp}</div>
-            <p style="color: #999; font-size: 13px; margin-bottom: 0;">
-              This OTP is valid for <strong>5 minutes</strong>. Do not share this code with anyone.
-            </p>
-          </div>
-          <div class="footer">
-            If you did not request this verification code, please ignore this email.<br>
-            Zerodha Broking Limited • Bengaluru, India
-          </div>
-        </div>
-      </body>
-      </html>
-    `;
+    const info = await sendMailWithTimeout(
+      transporter,
+      {
+        from: `"${fromName}" <${emailUser}>`,
+        to: toEmail,
+        subject,
+        text,
+        html: htmlContent,
+      },
+      8500
+    );
 
-    const info = await sendMailWithTimeout(transporter, {
-      from: `"Zerodha Kite" <${emailUser}>`,
-      to: toEmail,
-      subject: `${otp} is your Zerodha verification code`,
-      text: `Your Zerodha verification code is ${otp}. Valid for 5 minutes.`,
-      html: htmlContent,
-    }, 8500);
-
-    console.log(`✉️ [LIVE EMAIL DELIVERED] OTP sent to ${toEmail} (MessageId: ${info.messageId})`);
-    return {
-      delivered: true,
-      messageId: info.messageId,
-    };
+    console.log(`✉️ [LIVE SMTP EMAIL DELIVERED] Sent to ${toEmail} (MessageId: ${info.messageId})`);
+    return { delivered: true, messageId: info.messageId };
   } catch (error) {
     console.warn(`⚠️ [EMAIL DELIVERY NOTE] Could not deliver email to ${toEmail}: ${error.message}`);
-    return {
-      delivered: false,
-      reason: error.message,
-    };
+    return { delivered: false, reason: error.message };
   }
+}
+
+/**
+ * Sends a branded Zerodha Kite OTP email to the user.
+ * Supports Gmail App Passwords, Custom SMTP, or falls back gracefully to console delivery.
+ */
+async function sendOtpEmail(toEmail, otp) {
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f7f9fc; margin: 0; padding: 20px; color: #424242; }
+        .container { max-width: 500px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e0e0e0; overflow: hidden; }
+        .header { background: #ffffff; padding: 24px; text-align: center; border-bottom: 1px solid #f0f0f0; }
+        .content { padding: 32px 24px; text-align: center; }
+        .otp-box { display: inline-block; background: #f0f7ff; border: 2px dashed #387ed1; border-radius: 8px; padding: 14px 28px; font-size: 32px; font-weight: bold; letter-spacing: 6px; color: #387ed1; margin: 24px 0; }
+        .footer { background: #fafafa; padding: 16px 24px; font-size: 12px; color: #888888; text-align: center; border-top: 1px solid #f0f0f0; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <div class="header">
+          <h2 style="color: #387ed1; margin: 0; font-weight: 700; letter-spacing: 1px;">ZERODHA</h2>
+        </div>
+        <div class="content">
+          <h3 style="margin-top: 0; color: #222;">Login / Signup Verification</h3>
+          <p style="color: #666; font-size: 14px; line-height: 1.6;">
+            Please use the verification code below to complete your login or registration on Zerodha Kite.
+          </p>
+          <div class="otp-box">${otp}</div>
+          <p style="color: #999; font-size: 13px; margin-bottom: 0;">
+            This OTP is valid for <strong>5 minutes</strong>. Do not share this code with anyone.
+          </p>
+        </div>
+        <div class="footer">
+          If you did not request this verification code, please ignore this email.<br>
+          Zerodha Broking Limited • Bengaluru, India
+        </div>
+      </div>
+    </body>
+    </html>
+  `;
+
+  return sendUniversalEmail({
+    toEmail,
+    subject: `${otp} is your Zerodha verification code`,
+    text: `Your Zerodha verification code is ${otp}. Valid for 5 minutes.`,
+    htmlContent,
+    fromName: "Zerodha Kite",
+  });
 }
 
 /**
