@@ -33,10 +33,16 @@ const MONGO_URL = process.env.MONGO_URL;
 const PUBLIC_FRONTEND_URL = process.env.PUBLIC_FRONTEND_URL || "http://localhost:3001";
 const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || "http://localhost:3002";
 
+const rawAllowedOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 const ALLOWED_ORIGINS = [
   ...(!IS_PROD
     ? ["http://localhost:3000", "http://localhost:3001", "http://localhost:3003"]
     : []),
+  ...rawAllowedOrigins,
   process.env.FRONTEND_URL,
   process.env.PUBLIC_FRONTEND_URL,
   process.env.ADMIN_URL,
