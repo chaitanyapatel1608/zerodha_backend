@@ -18,7 +18,7 @@
     "start": "node index.js",
     "dev": "nodemon index.js",
     "test:unit": "node --test tests/unit_utils.test.js",
-    "test": "node --test --test-concurrency=1 tests/unit_utils.test.js tests/security.test.js tests/auth_financial.test.js tests/security_regression.test.js tests/trading_lifecycle.test.js"
+    "test": "node --test --test-concurrency=1 tests/unit_utils.test.js tests/security.test.js tests/auth_financial.test.js tests/security_regression.test.js tests/trading_lifecycle.test.js tests/admin_rbac.test.js"
   },
   "devDependencies": {
     "nodemon": "^3.1.14"

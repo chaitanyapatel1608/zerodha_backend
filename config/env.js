@@ -34,10 +34,13 @@ const PUBLIC_FRONTEND_URL = process.env.PUBLIC_FRONTEND_URL || "http://localhost
 const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || "http://localhost:3002";
 
 const ALLOWED_ORIGINS = [
-  "http://localhost:3000",
-  "http://localhost:3001",
+  ...(!IS_PROD
+    ? ["http://localhost:3000", "http://localhost:3001", "http://localhost:3003"]
+    : []),
   process.env.FRONTEND_URL,
   process.env.PUBLIC_FRONTEND_URL,
+  process.env.ADMIN_URL,
+  process.env.PUBLIC_ADMIN_URL,
 ].filter(Boolean);
 
 module.exports = {

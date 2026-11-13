@@ -24,8 +24,17 @@ const tradeFundsLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const catalogLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  message: { success: false, message: "Too many catalog requests. Please slow down." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 module.exports = {
   otpLimiter,
   authLimiter,
   tradeFundsLimiter,
+  catalogLimiter,
 };

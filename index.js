@@ -24,7 +24,7 @@ const {
   isValidObjectId,
 } = require("./utils/security");
 const { getAuthenticatedUserId, requireAuth } = require("./middleware/auth");
-const { otpLimiter, authLimiter, tradeFundsLimiter } = require("./middleware/rateLimiters");
+const { otpLimiter, authLimiter, tradeFundsLimiter, catalogLimiter } = require("./middleware/rateLimiters");
 const {
   toPaise,
   fromPaise,
@@ -39,6 +39,7 @@ const { decryptField } = require("./utils/encryption");
 const { withUserLock, acquireDistributedLock, releaseDistributedLock } = require("./utils/locks");
 const { runInTransaction } = require("./utils/transactions");
 const healthRoutes = require("./routes/healthRoutes");
+const adminRoutes = require("./routes/adminRoutes");
 
 const { HoldingsModel } = require("./model/HoldingsModel");
 const { PositionsModel } = require("./model/PositionsModel");
@@ -108,6 +109,7 @@ app.use(
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 app.use(healthRoutes);
+app.use("/admin", adminRoutes);
 
 // Global ObjectId pre-validation for all :id routes (prevents CastError 500s)
 app.param("id", (req, res, next, id) => {
@@ -1481,7 +1483,7 @@ app.get("/masterInstruments", async (req, res) => {
 });
 
 // GET /allInstruments - Complete 104 master instruments catalog with live prices
-app.get("/allInstruments", async (req, res) => {
+app.get("/allInstruments", catalogLimiter, async (req, res) => {
   try {
     let results = await InstrumentModel.find({}).lean();
     if (!results || results.length === 0) {
@@ -1681,7 +1683,7 @@ app.get("/userFunds", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/allIpos", async (req, res) => {
+app.get("/allIpos", catalogLimiter, async (req, res) => {
   try {
     let allIpos = await IpoModel.find({});
     if (allIpos.length < 50) {
@@ -3611,7 +3613,7 @@ const curatedGsecs = [
   },
 ];
 
-app.get("/allGsecs", async (req, res) => {
+app.get("/allGsecs", catalogLimiter, async (req, res) => {
   res.status(200).json(curatedGsecs);
 });
 
@@ -3718,7 +3720,7 @@ const curatedCorporateActions = [
   },
 ];
 
-app.get("/allCorporateActions", async (req, res) => {
+app.get("/allCorporateActions", catalogLimiter, async (req, res) => {
   res.status(200).json(curatedCorporateActions);
 });
 
@@ -3799,7 +3801,7 @@ app.get("/myCorporateActionTenders", requireAuth, async (req, res) => {
 // AUCTIONS (EXCHANGE SETTLEMENT AUCTIONS FOR SHORT DELIVERIES)
 // ============================================================================
 
-app.get("/allAuctions", async (req, res) => {
+app.get("/allAuctions", catalogLimiter, async (req, res) => {
   try {
     let count = await AuctionModel.countDocuments();
     if (count === 0) {
@@ -3963,7 +3965,7 @@ app.get("/myAuctionOffers", requireAuth, async (req, res) => {
 // SOCIAL STOCK EXCHANGE (SSE IPO - ZERO COUPON ZERO PRINCIPAL / ZCZP)
 // ============================================================================
 
-app.get("/allSseIpos", async (req, res) => {
+app.get("/allSseIpos", catalogLimiter, async (req, res) => {
   try {
     let count = await SseIpoModel.countDocuments();
     if (count === 0) {
@@ -4185,7 +4187,7 @@ function advanceNextTriggerDate(frequency, scheduleDay, scheduleTime, currentTri
 }
 
 // 0. Catalog of 50 Real Market SIPs (Stored in & Fetched directly from MongoDB Atlas!)
-app.get("/marketSipsCatalog", async (req, res) => {
+app.get("/marketSipsCatalog", catalogLimiter, async (req, res) => {
   try {
     let catalog = await MarketSipCatalogModel.find({}).sort({ code: 1 }).lean();
     if (!catalog || catalog.length === 0) {

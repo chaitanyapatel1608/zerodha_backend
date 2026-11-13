@@ -65,7 +65,45 @@ async function requireAuth(req, res, next) {
   return next();
 }
 
+/**
+ * Express middleware enforcing admin RBAC by checking UserModel.role in MongoDB.
+ * Must run after requireAuth.
+ */
+async function requireAdmin(req, res, next) {
+  if (!req.authUserId) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+    });
+  }
+
+  try {
+    const user = await UserModel.findOne({ userId: req.authUserId })
+      .select("role email fullName")
+      .lean();
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin privileges required.",
+      });
+    }
+    req.adminUser = {
+      userId: req.authUserId,
+      email: user.email || "",
+      fullName: user.fullName || "",
+      role: user.role,
+    };
+    return next();
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Authorization verification error",
+    });
+  }
+}
+
 module.exports = {
   getAuthenticatedUserId,
   requireAuth,
+  requireAdmin,
 };
