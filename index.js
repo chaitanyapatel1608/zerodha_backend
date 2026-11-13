@@ -149,7 +149,7 @@ function issueAuthSession(res, req, user) {
   res.cookie("zerodha_session", token, buildCookieOptions(req, true));
   res.cookie("zerodha_csrf", csrfToken, buildCookieOptions(req, false));
   res.setHeader("Cache-Control", "no-store");
-  return token;
+  return { token, csrfToken };
 }
 
 function clearAuthCookies(res, req) {
@@ -447,12 +447,13 @@ app.post("/verify-otp", authLimiter, async (req, res) => {
     }
 
     // Sign versioned JWT and issue HttpOnly session + CSRF cookies
-    const token = issueAuthSession(res, req, user);
+    const { token, csrfToken } = issueAuthSession(res, req, user);
 
     return res.status(200).json({
       success: true,
       message: "Authentication successful!",
       token,
+      csrfToken,
       user: {
         userId: user.userId,
         email: user.email,
@@ -524,7 +525,7 @@ app.post("/kite-login", authLimiter, async (req, res) => {
     user.lastLogin = new Date();
     await user.save();
 
-    const token = issueAuthSession(res, req, user);
+    const { token, csrfToken } = issueAuthSession(res, req, user);
 
     logger.info("kite_login_success", { userId: user.userId });
 
@@ -532,6 +533,7 @@ app.post("/kite-login", authLimiter, async (req, res) => {
       success: true,
       message: "Login successful!",
       token,
+      csrfToken,
       user: {
         userId: user.userId,
         email: user.email,
@@ -551,6 +553,18 @@ app.post("/kite-login", authLimiter, async (req, res) => {
   }
 });
 
+// 2b. CSRF Token Endpoint for cross-domain SPA clients
+app.get("/csrf-token", (req, res) => {
+  const cookies = parseCookies(req.headers?.cookie || "");
+  let csrfToken = cookies.zerodha_csrf;
+  if (!csrfToken) {
+    csrfToken = crypto.randomBytes(32).toString("hex");
+    res.cookie("zerodha_csrf", csrfToken, buildCookieOptions(req, false));
+  }
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({ success: true, csrfToken });
+});
+
 // 3. Verify Active Session Token
 app.get("/verifyUser", requireAuth, async (req, res) => {
   try {
@@ -562,8 +576,16 @@ app.get("/verifyUser", requireAuth, async (req, res) => {
       return res.status(404).json({ success: false, message: "User not found" });
     }
 
+    const cookies = parseCookies(req.headers?.cookie || "");
+    let csrfToken = cookies.zerodha_csrf || "";
+    if (!csrfToken) {
+      csrfToken = crypto.randomBytes(32).toString("hex");
+      res.cookie("zerodha_csrf", csrfToken, buildCookieOptions(req, false));
+    }
+
     return res.status(200).json({
       success: true,
+      csrfToken,
       user: {
         userId: user.userId,
         email: user.email,
