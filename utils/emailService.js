@@ -6,18 +6,24 @@ function createMailTransporter() {
   if (!emailUser || !emailPass) return null;
 
   return nodemailer.createTransport({
-    service: process.env.EMAIL_SERVICE || "gmail",
+    host: "smtp.gmail.com",
+    port: 587,
+    secure: false, // true for port 465, false for port 587 (uses STARTTLS)
+    requireTLS: true,
     auth: {
       user: emailUser,
       pass: emailPass,
     },
-    connectionTimeout: 4000,
-    greetingTimeout: 4000,
-    socketTimeout: 4000,
+    tls: {
+      rejectUnauthorized: false,
+    },
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 8000,
   });
 }
 
-function sendMailWithTimeout(transporter, mailOptions, timeoutMs = 4500) {
+function sendMailWithTimeout(transporter, mailOptions, timeoutMs = 8500) {
   const sendPromise = transporter.sendMail(mailOptions);
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error("SMTP_CONNECTION_TIMEOUT")), timeoutMs)
@@ -91,7 +97,7 @@ async function sendOtpEmail(toEmail, otp) {
       subject: `${otp} is your Zerodha verification code`,
       text: `Your Zerodha verification code is ${otp}. Valid for 5 minutes.`,
       html: htmlContent,
-    }, 4500);
+    }, 8500);
 
     console.log(`✉️ [LIVE EMAIL DELIVERED] OTP sent to ${toEmail} (MessageId: ${info.messageId})`);
     return {
