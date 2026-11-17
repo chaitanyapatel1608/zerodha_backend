@@ -60,6 +60,7 @@ const ALLOWED_ORIGINS = [
   "https://zerodha-dashboard-6zf2.onrender.com",
   "https://zerodha-admin.onrender.com",
   "https://zerodha-backend-xbtx.onrender.com",
+  "null",
 ].filter(Boolean);
 
 module.exports = {

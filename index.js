@@ -101,6 +101,8 @@ app.use(
     origin: function (origin, callback) {
       if (
         !origin ||
+        origin === "null" ||
+        origin === "undefined" ||
         allowedOrigins.includes(origin) ||
         origin.endsWith(".onrender.com") ||
         !IS_PROD
