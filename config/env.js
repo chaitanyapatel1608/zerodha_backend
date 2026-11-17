@@ -30,8 +30,14 @@ const JWT_SECRET =
 
 const PORT = Number(process.env.PORT) || 3002;
 const MONGO_URL = process.env.MONGO_URL;
-const PUBLIC_FRONTEND_URL = process.env.PUBLIC_FRONTEND_URL || "http://localhost:3001";
-const PUBLIC_BACKEND_URL = process.env.PUBLIC_BACKEND_URL || "http://localhost:3002";
+const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL);
+const PUBLIC_FRONTEND_URL =
+  process.env.PUBLIC_FRONTEND_URL ||
+  (isRender ? "https://zerodha-dashboard-6zf2.onrender.com" : "http://localhost:3001");
+const PUBLIC_BACKEND_URL =
+  process.env.PUBLIC_BACKEND_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  (isRender ? "https://zerodha-backend-xbtx.onrender.com" : "http://localhost:3002");
 
 const rawAllowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")

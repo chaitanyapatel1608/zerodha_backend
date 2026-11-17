@@ -371,21 +371,13 @@ async function sendIpoMandateEmail({
       </html>
     `;
 
-    const info = await transporter.sendMail({
-      from: `"Zerodha Kite" <${emailUser}>`,
-      to: toEmail,
+    return sendUniversalEmail({
+      toEmail,
       subject: `Action Required: Authorize UPI Mandate for ${companyName} (${applicationNumber})`,
       text: `Action Required: Authorize UPI Mandate of ₹${formattedAmount} for ${companyName} (${applicationNumber}). Approve here: ${approveUrl} or Decline here: ${declineUrl}`,
-      html: htmlContent,
+      htmlContent,
+      fromName: "Zerodha Kite",
     });
-
-    console.log(
-      `✉️ [LIVE IPO MANDATE EMAIL SENT] Sent to ${toEmail} for ${companyName} (MessageId: ${info.messageId})`
-    );
-    return {
-      delivered: true,
-      messageId: info.messageId,
-    };
   } catch (error) {
     console.error(
       `❌ [EMAIL DELIVERY FAILED] Could not send IPO mandate email to ${toEmail}:`,
@@ -985,16 +977,13 @@ async function sendFundDepositEmail({
       </html>
     `;
 
-    const info = await transporter.sendMail({
-      from: `"Zerodha Kite" <${emailUser}>`,
-      to: toEmail,
+    return sendUniversalEmail({
+      toEmail,
       subject: `Action Required: Approve UPI Fund Transfer of ₹${formattedAmount} (Ref: ${referenceId})`,
       text: `Action Required: Approve UPI Fund Transfer of ₹${formattedAmount} to your Zerodha trading account. Approve here: ${approveUrl} or Decline here: ${declineUrl}`,
-      html: htmlContent,
+      htmlContent,
+      fromName: "Zerodha Kite",
     });
-
-    console.log(`✉️ [FUND DEPOSIT EMAIL SENT] Sent to ${toEmail} (Ref: ${referenceId})`);
-    return { delivered: true, messageId: info.messageId };
   } catch (error) {
     console.error(`❌ [FUND DEPOSIT EMAIL ERROR] Failed to send email to ${toEmail}:`, error.message);
     return { delivered: false, reason: error.message };

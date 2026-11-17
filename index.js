@@ -2596,6 +2596,8 @@ app.post("/fundDeposit/initiate", requireAuth, tradeFundsLimiter, async (req, re
       success: true,
       message: `UPI Collect Request sent to ${cleanUpi}! Please approve the payment via the authorization email sent to ${userEmail}.`,
       transaction: safeTx,
+      approveUrl,
+      declineUrl,
     });
   } catch (error) {
     logger.error("fund_deposit_initiate_error", { error: error.message });
