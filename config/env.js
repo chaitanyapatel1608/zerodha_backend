@@ -46,13 +46,20 @@ const rawAllowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 
 const ALLOWED_ORIGINS = [
   ...(!IS_PROD
-    ? ["http://localhost:3000", "http://localhost:3001", "http://localhost:3003"]
+    ? ["http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "http://localhost:3003"]
     : []),
   ...rawAllowedOrigins,
   process.env.FRONTEND_URL,
   process.env.PUBLIC_FRONTEND_URL,
   process.env.ADMIN_URL,
   process.env.PUBLIC_ADMIN_URL,
+  process.env.BACKEND_URL,
+  process.env.PUBLIC_BACKEND_URL,
+  process.env.RENDER_EXTERNAL_URL,
+  "https://zerodha-frontend-58j9.onrender.com",
+  "https://zerodha-dashboard-6zf2.onrender.com",
+  "https://zerodha-admin.onrender.com",
+  "https://zerodha-backend-xbtx.onrender.com",
 ].filter(Boolean);
 
 module.exports = {

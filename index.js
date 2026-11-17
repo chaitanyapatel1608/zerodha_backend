@@ -99,7 +99,12 @@ app.use(
 app.use(
   cors({
     origin: function (origin, callback) {
-      if (!origin || allowedOrigins.includes(origin) || !IS_PROD) {
+      if (
+        !origin ||
+        allowedOrigins.includes(origin) ||
+        origin.endsWith(".onrender.com") ||
+        !IS_PROD
+      ) {
         return callback(null, true);
       }
       return callback(new Error("CORS origin blocked by policy: " + origin));
