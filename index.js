@@ -24,6 +24,7 @@ const {
   escapeRegex,
   isValidObjectId,
   parseCookies,
+  resolveAuthContext,
 } = require("./utils/security");
 const { getAuthenticatedUserId, requireAuth } = require("./middleware/auth");
 const { otpLimiter, authLimiter, tradeFundsLimiter, catalogLimiter } = require("./middleware/rateLimiters");

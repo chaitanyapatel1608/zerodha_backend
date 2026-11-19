@@ -71,3 +71,26 @@ test("login dispatch sends the generated OTP but does not log or return it outsi
     assert.ok(!logs.join("\n").includes(generated));
   } finally { process.env.NODE_ENV = "test"; }
 });
+
+test("GET /fundDeposit/action redirects unauthenticated users to login with preserved context", async (t) => {
+  const { FundsTransactionModel } = require("../model/FundsTransactionModel");
+  t.mock.method(FundsTransactionModel, "findOne", async () => ({
+    approvalToken: "tok123",
+    status: "PENDING_APPROVAL",
+    amount: 10000,
+    userId: "ZU1001",
+    approvalExpiresAt: new Date(Date.now() + 86400000),
+    referenceId: "UPI12345",
+    upiId: "test@upi",
+  }));
+
+  const res = await fetch(`${base}/fundDeposit/action?token=tok123&decision=APPROVE`, {
+    redirect: "manual",
+  });
+
+  assert.equal(res.status, 302);
+  const location = res.headers.get("location");
+  assert.ok(location.includes("/login?notice="));
+  assert.ok(location.includes("redirect_uri="));
+  assert.ok(decodeURIComponent(location).includes("token=tok123"));
+});
