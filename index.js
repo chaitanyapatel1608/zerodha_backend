@@ -2352,7 +2352,7 @@ app.post("/fundDeposit/initiate", requireAuth, tradeFundsLimiter, async (req, re
 });
 
 // 2a. Confirmation GET page (does not mutate state on GET pre-fetch / link scan)
-app.get("/fundDeposit/action", requireAuth, async (req, res) => {
+app.get("/fundDeposit/action", async (req, res) => {
   try {
     const token = typeof req.query.token === "string" ? req.query.token.trim() : "";
     const decision = typeof req.query.decision === "string" ? req.query.decision.trim().toUpperCase() : "";
@@ -2360,7 +2360,7 @@ app.get("/fundDeposit/action", requireAuth, async (req, res) => {
       return res.status(400).send("<h3>Invalid or missing deposit action parameters.</h3>");
     }
 
-    const tx = await FundsTransactionModel.findOne({ approvalToken: token, userId: getAuthenticatedUserId(req) });
+    const tx = await FundsTransactionModel.findOne({ approvalToken: token });
     if (!tx || (tx.approvalExpiresAt && new Date(tx.approvalExpiresAt) < new Date())) {
       return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Request Expired</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Link Expired or Invalid</h2><p>We could not find an active deposit request for this token.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds">Return to Zerodha Kite</a></body></html>`);
     }
@@ -2369,9 +2369,60 @@ app.get("/fundDeposit/action", requireAuth, async (req, res) => {
       return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Already Processed</h2><p>Deposit request <strong>${escapeHtml(tx.referenceId)}</strong> has already been marked as <strong>${escapeHtml(tx.status)}</strong>.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds">View in Zerodha Kite</a></body></html>`);
     }
 
+    // Authenticate session via cookie, Bearer header, or passed auth_token
+    const authContext = resolveAuthContext(req, JWT_SECRET);
+
+    // If unauthenticated: redirect to login with informative notice banner and return target
+    if (!authContext || !authContext.userId) {
+      const currentActionUrl = `${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${encodeURIComponent(token)}&decision=${encodeURIComponent(decision)}`;
+      const notice = `Please log in to your Kite account to authorize this ₹${formatIndianCurrency(tx.amount)} fund deposit.`;
+      return res.redirect(`${PUBLIC_FRONTEND_URL}/login?notice=${encodeURIComponent(notice)}&redirect_uri=${encodeURIComponent(currentActionUrl)}`);
+    }
+
+    // If authenticated user does not match the transaction owner
+    if (authContext.userId !== tx.userId) {
+      return res.status(403).send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Account Mismatch - Zerodha Kite</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; }
+    .card { max-width: 520px; margin: 0 auto; background: #fff; padding: 40px 32px; border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
+    h2 { margin: 0 0 12px 0; color: #dc2626; font-size: 20px; }
+    p { font-size: 14px; color: #64748b; line-height: 1.6; }
+    .btn { display: inline-block; background: #387ed1; color: #fff !important; padding: 12px 24px; border-radius: 4px; text-decoration: none; font-weight: 500; font-size: 14px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Account Mismatch</h2>
+    <p>You are currently logged in as user <strong>${escapeHtml(authContext.userId)}</strong>, but this deposit authorization was initiated for a different account.</p>
+    <p>Please log in with the correct Zerodha Kite account to authorize this transfer.</p>
+    <a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/login?notice=${encodeURIComponent(`Please log in as account holder to authorize ₹${formatIndianCurrency(tx.amount)} deposit.`)}&redirect_uri=${encodeURIComponent(`${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${encodeURIComponent(token)}&decision=${encodeURIComponent(decision)}`)}" class="btn">Switch Account &amp; Log In</a>
+  </div>
+</body>
+</html>`);
+    }
+
+    // If user arrived with auth_token in query, issue session cookies on backend domain as well
+    const handoffToken = typeof req.query.auth_token === "string" ? req.query.auth_token.trim() : "";
+    if (handoffToken && typeof issueAuthSession === "function") {
+      try {
+        const ownerUser = await UserModel.findOne({ userId: tx.userId }).lean();
+        if (ownerUser) {
+          issueAuthSession(res, req, ownerUser);
+        }
+      } catch (cookieErr) {
+        logger.warn("fund_deposit_cookie_set_failed", { error: cookieErr.message });
+      }
+    }
+
+    const cookies = parseCookies(req.headers.cookie || "");
     return res.send(
       renderConfirmationPage({
-        csrfToken: parseCookies(req.headers.cookie || "").zerodha_csrf,
+        csrfToken: cookies.zerodha_csrf || "",
+        authToken: handoffToken,
         title: decision === "APPROVE" ? "Confirm demo fund deposit" : "Decline UPI Fund Deposit",
         subtitle: "Confirm this simulated deposit. No real payment occurs.",
         actionUrl: `${PUBLIC_BACKEND_URL}/fundDeposit/action`,
@@ -3223,8 +3274,58 @@ app.get("/ipoMandate/action", async (req, res) => {
       return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Mandate Already Processed</h2><p>Mandate for <strong>${escapeHtml(application.companyName)}</strong> has already been marked as <strong>${escapeHtml(application.mandateStatus)}</strong>.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/bids">View in Zerodha Kite</a></body></html>`);
     }
 
+    // Authenticate session via cookie, Bearer header, or passed auth_token
+    const authContext = resolveAuthContext(req, JWT_SECRET);
+
+    // If unauthenticated: redirect to login with informative notice banner and return target
+    if (!authContext || !authContext.userId) {
+      const currentActionUrl = `${PUBLIC_BACKEND_URL}/ipoMandate/action?token=${encodeURIComponent(token)}&decision=${encodeURIComponent(decision)}`;
+      const notice = `Please log in to your Kite account to authorize the IPO mandate for ${application.companyName}.`;
+      return res.redirect(`${PUBLIC_FRONTEND_URL}/login?notice=${encodeURIComponent(notice)}&redirect_uri=${encodeURIComponent(currentActionUrl)}`);
+    }
+
+    // If authenticated user does not match the application owner
+    if (application.userId && authContext.userId !== application.userId) {
+      return res.status(403).send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Account Mismatch - Zerodha Kite</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; }
+    .card { max-width: 520px; margin: 0 auto; background: #fff; padding: 40px 32px; border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
+    h2 { margin: 0 0 12px 0; color: #dc2626; font-size: 20px; }
+    p { font-size: 14px; color: #64748b; line-height: 1.6; }
+    .btn { display: inline-block; background: #387ed1; color: #fff !important; padding: 12px 24px; border-radius: 4px; text-decoration: none; font-weight: 500; font-size: 14px; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Account Mismatch</h2>
+    <p>You are currently logged in as user <strong>${escapeHtml(authContext.userId)}</strong>, but this IPO mandate belongs to a different account.</p>
+    <a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/login?redirect_uri=${encodeURIComponent(`${PUBLIC_BACKEND_URL}/ipoMandate/action?token=${encodeURIComponent(token)}&decision=${encodeURIComponent(decision)}`)}" class="btn">Switch Account &amp; Log In</a>
+  </div>
+</body>
+</html>`);
+    }
+
+    const handoffToken = typeof req.query.auth_token === "string" ? req.query.auth_token.trim() : "";
+    if (handoffToken && typeof issueAuthSession === "function") {
+      try {
+        const ownerUser = await UserModel.findOne({ userId: application.userId }).lean();
+        if (ownerUser) {
+          issueAuthSession(res, req, ownerUser);
+        }
+      } catch (cookieErr) {
+        logger.warn("ipo_mandate_cookie_set_failed", { error: cookieErr.message });
+      }
+    }
+
+    const cookies = parseCookies(req.headers.cookie || "");
     return res.send(
       renderConfirmationPage({
+        csrfToken: cookies.zerodha_csrf || "",
+        authToken: handoffToken,
         title: decision === "APPROVE" ? "Confirm IPO UPI Mandate" : "Decline IPO UPI Mandate",
         subtitle: `Authorize or decline the ASBA block for ${application.companyName}.`,
         actionUrl: `${PUBLIC_BACKEND_URL}/ipoMandate/action`,

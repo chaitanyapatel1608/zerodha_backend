@@ -1,10 +1,11 @@
-const { JWT_SECRET } = require("../config/env");
+const { JWT_SECRET, PUBLIC_FRONTEND_URL } = require("../config/env");
 const {
   resolveAuthContext,
   resolveAuthenticatedUserId,
   parseCookies,
   constantTimeEquals,
 } = require("../utils/security");
+const { escapeHtml } = require("../utils/html");
 const { UserModel } = require("../model/UserModel");
 
 const STATE_CHANGING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
@@ -26,6 +27,13 @@ function getAuthenticatedUserId(req) {
 async function requireAuth(req, res, next) {
   const ctx = resolveAuthContext(req, JWT_SECRET);
   if (!ctx) {
+    if (req.path === "/fundDeposit/action" || req.path === "/ipoMandate/action") {
+      const loginUrl = `${PUBLIC_FRONTEND_URL}/login?notice=${encodeURIComponent("Please log in to your Kite account to authorize this transaction.")}`;
+      if (req.method === "GET") {
+        return res.redirect(loginUrl);
+      }
+      return res.status(401).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Authentication Required - Zerodha Kite</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;padding:50px 20px;text-align:center;color:#0f172a;}.card{max-width:500px;margin:0 auto;background:#fff;padding:36px;border-radius:10px;border:1px solid #e2e8f0;box-shadow:0 10px 30px rgba(0,0,0,0.06);}.btn{display:inline-block;background:#387ed1;color:#fff !important;padding:12px 24px;border-radius:4px;text-decoration:none;font-weight:500;margin-top:18px;}</style></head><body><div class="card"><h2>Authentication Required</h2><p style="color:#64748b;font-size:14px;margin-top:8px;">Please log in to your Zerodha Kite account to authorize this transaction.</p><a href="${escapeHtml(loginUrl)}" class="btn">Log In to Kite</a></div></body></html>`);
+    }
     return res.status(401).json({
       success: false,
       message: "Authentication required. Please log in to continue.",
@@ -48,6 +56,13 @@ async function requireAuth(req, res, next) {
   try {
     const user = await UserModel.findOne({ userId: ctx.userId }).select("tokenVersion").lean();
     if (!user || (user.tokenVersion || 0) !== ctx.tokenVersion) {
+      if (req.path === "/fundDeposit/action" || req.path === "/ipoMandate/action") {
+        const loginUrl = `${PUBLIC_FRONTEND_URL}/login?notice=${encodeURIComponent("Your session has expired. Please log in again to authorize this transaction.")}`;
+        if (req.method === "GET") {
+          return res.redirect(loginUrl);
+        }
+        return res.status(401).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Session Expired - Zerodha Kite</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;padding:50px 20px;text-align:center;color:#0f172a;}.card{max-width:500px;margin:0 auto;background:#fff;padding:36px;border-radius:10px;border:1px solid #e2e8f0;box-shadow:0 10px 30px rgba(0,0,0,0.06);}.btn{display:inline-block;background:#387ed1;color:#fff !important;padding:12px 24px;border-radius:4px;text-decoration:none;font-weight:500;margin-top:18px;}</style></head><body><div class="card"><h2>Session Expired</h2><p style="color:#64748b;font-size:14px;margin-top:8px;">Your session has expired. Please log in again to authorize this transaction.</p><a href="${escapeHtml(loginUrl)}" class="btn">Log In to Kite</a></div></body></html>`);
+      }
       return res.status(401).json({
         success: false,
         message: "Session has been revoked or expired. Please log in again.",

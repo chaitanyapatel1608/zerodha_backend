@@ -22,6 +22,7 @@ function renderConfirmationPage({
   token,
   decision,
   csrfToken,
+  authToken,
   details = [],
   returnUrl,
 }) {
@@ -73,6 +74,7 @@ function renderConfirmationPage({
     <table class="details">${rowsHtml}</table>
     <form method="POST" action="${escapeHtml(actionUrl)}" class="form-actions">
       ${csrfToken ? `<input type="hidden" name="csrfToken" value="${escapeHtml(csrfToken)}" />` : ""}
+      ${authToken ? `<input type="hidden" name="authToken" value="${escapeHtml(authToken)}" />` : ""}
       <input type="hidden" name="token" value="${escapeHtml(token)}" />
       <input type="hidden" name="decision" value="${escapeHtml(decision)}" />
       <button type="submit" class="btn">${escapeHtml(buttonLabel)}</button>

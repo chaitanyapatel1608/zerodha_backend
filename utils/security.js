@@ -98,6 +98,16 @@ function resolveAuthContext(req, jwtSecret) {
     }
   }
 
+  // Support authenticated handoff token passed via secure redirect query or POST body
+  if (!token && req?.query?.auth_token && typeof req.query.auth_token === "string") {
+    token = req.query.auth_token.trim();
+    authSource = "bearer";
+  }
+  if (!token && req?.body?.authToken && typeof req.body.authToken === "string") {
+    token = req.body.authToken.trim();
+    authSource = "bearer";
+  }
+
   if (!token) return null;
   try {
     const decoded = jwt.verify(token, jwtSecret, { algorithms: ["HS256"] });

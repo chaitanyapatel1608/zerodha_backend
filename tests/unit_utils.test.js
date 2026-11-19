@@ -172,6 +172,12 @@ test("UNIT-Security: resolveAuthContext validates HS256 JWTs from Bearer and coo
   const cookieCtx = resolveAuthContext({ headers: { cookie: `zerodha_session=${validToken}` } }, secret);
   assert.deepEqual(cookieCtx, { userId: "ZU1001", tokenVersion: 2, authSource: "cookie" });
 
+  const queryCtx = resolveAuthContext({ query: { auth_token: validToken } }, secret);
+  assert.deepEqual(queryCtx, { userId: "ZU1001", tokenVersion: 2, authSource: "bearer" });
+
+  const bodyCtx = resolveAuthContext({ body: { authToken: validToken } }, secret);
+  assert.deepEqual(bodyCtx, { userId: "ZU1001", tokenVersion: 2, authSource: "bearer" });
+
   assert.equal(resolveAuthenticatedUserId({ headers: { authorization: `Bearer ${expiredToken}` } }, secret), null);
   assert.equal(resolveAuthenticatedUserId({ headers: { authorization: `Bearer ${wrongSecretToken}` } }, secret), null);
   assert.equal(resolveAuthenticatedUserId({ headers: { authorization: `Bearer ${emptyUserToken}` } }, secret), null);
