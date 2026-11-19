@@ -2474,9 +2474,67 @@ async function handleFundDepositAction(req, res) {
 
 
     if (isApprove) {
-      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Approved - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#16a34a;">Funds Credited Successfully!</h2><p>Amount: <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong></p><p>Ref: <code>${escapeHtml(tx.referenceId)}</code> &bull; UPI: ${escapeHtml(tx.upiId)}</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds" style="display:inline-block;background:#16a34a;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;">View in Zerodha Kite Dashboard</a></div></body></html>`);
+      return res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Payment Approved - Zerodha Kite</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; -webkit-font-smoothing: antialiased; }
+    .card { max-width: 520px; margin: 0 auto; background: #fff; padding: 40px 32px; border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
+    .success-badge { display: inline-flex; align-items: center; justify-content: center; width: 56px; height: 56px; background: #ecfdf5; border-radius: 50%; color: #16a34a; font-size: 28px; margin-bottom: 16px; border: 2px solid #a7f3d0; }
+    h2 { margin: 0 0 8px 0; color: #16a34a; font-size: 22px; font-weight: 700; }
+    p.amount-sub { font-size: 14px; color: #64748b; margin: 0 0 24px 0; }
+    .details-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 14px 18px; margin-bottom: 26px; text-align: left; font-size: 13.5px; }
+    .details-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #e2e8f0; }
+    .details-row:last-child { border-bottom: none; }
+    .label { color: #64748b; }
+    .val { font-weight: 600; color: #0f172a; text-align: right; }
+    .btn-dashboard { display: inline-block; background: #16a34a; color: #ffffff !important; padding: 13px 30px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14.5px; box-shadow: 0 2px 8px rgba(22, 163, 74, 0.35); }
+    .btn-dashboard:hover { opacity: 0.93; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="success-badge">&#10003;</div>
+    <h2>Funds Credited Successfully!</h2>
+    <p class="amount-sub">Amount: <strong style="color: #065f46; font-size: 16px;">₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong> credited to your account.</p>
+    <div class="details-box">
+      <div class="details-row"><span class="label">Reference ID</span><span class="val" style="font-family: monospace;">${escapeHtml(tx.referenceId)}</span></div>
+      <div class="details-row"><span class="label">Payer UPI ID</span><span class="val">${escapeHtml(tx.upiId)}</span></div>
+      <div class="details-row"><span class="label">Target Segment</span><span class="val">Equity &amp; F&amp;O Margin</span></div>
+      <div class="details-row"><span class="label">Status</span><span class="val" style="color: #16a34a;">COMPLETED</span></div>
+    </div>
+    <a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds" class="btn-dashboard">View in Zerodha Kite Dashboard</a>
+  </div>
+</body>
+</html>`);
     }
-    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Transfer Declined - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#dc2626;">UPI Transfer Declined</h2><p>Declined request for <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong>. No funds transferred.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds">Return to Dashboard</a></div></body></html>`);
+    return res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Transfer Declined - Zerodha Kite</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f8fafc; margin: 0; padding: 40px 20px; color: #0f172a; text-align: center; -webkit-font-smoothing: antialiased; }
+    .card { max-width: 520px; margin: 0 auto; background: #fff; padding: 40px 32px; border-radius: 10px; border: 1px solid #e2e8f0; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
+    .decline-badge { display: inline-flex; align-items: center; justify-content: center; width: 56px; height: 56px; background: #fef2f2; border-radius: 50%; color: #dc2626; font-size: 28px; margin-bottom: 16px; border: 2px solid #fecaca; }
+    h2 { margin: 0 0 8px 0; color: #dc2626; font-size: 22px; font-weight: 700; }
+    p.amount-sub { font-size: 14px; color: #64748b; margin: 0 0 24px 0; }
+    .btn-return { display: inline-block; background: #334155; color: #ffffff !important; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-weight: 600; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="decline-badge">&#10005;</div>
+    <h2>UPI Transfer Declined</h2>
+    <p class="amount-sub">Declined request for <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong>. No funds were debited or transferred.</p>
+    <a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds" class="btn-return">Return to Dashboard</a>
+  </div>
+</body>
+</html>`);
   } catch (error) {
     logger.error("fund_deposit_post_action_error", { error: error.message });
     res.status(500).send("<h3>Server error processing deposit authorization.</h3>");

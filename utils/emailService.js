@@ -871,16 +871,132 @@ async function sendFundDepositEmail({
   approveUrl,
   declineUrl,
 }) {
-  const amountText = Number(amount).toLocaleString("en-IN", { minimumFractionDigits: 2 });
+  const amountText = Number(amount).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
   const { escapeHtml } = require("./html");
+
+  const htmlContent = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Action Required: Authorize UPI Fund Deposit</title>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f1f5f9; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; -webkit-font-smoothing: antialiased;">
+  <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f1f5f9; padding: 30px 15px;">
+    <tr>
+      <td align="center">
+        <!-- Main Card -->
+        <table width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width: 560px; background-color: #ffffff; border-radius: 8px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 16px rgba(0,0,0,0.05);">
+          
+          <!-- Branded Top Bar -->
+          <tr>
+            <td style="background-color: #ffffff; padding: 24px 30px 20px 30px; text-align: center; border-bottom: 2px solid #387ed1;">
+              <h1 style="margin: 0; font-size: 24px; font-weight: 700; color: #387ed1; letter-spacing: 1.5px;">ZERODHA</h1>
+              <div style="margin-top: 4px; font-size: 11px; text-transform: uppercase; letter-spacing: 1.8px; color: #64748b; font-weight: 600;">
+                Instant UPI Payin &bull; Margin Authorization
+              </div>
+            </td>
+          </tr>
+
+          <!-- Action Notice Banner -->
+          <tr>
+            <td style="padding: 24px 30px 10px 30px;">
+              <div style="background-color: #eff6ff; border-left: 4px solid #387ed1; padding: 14px 16px; border-radius: 4px;">
+                <p style="margin: 0; font-size: 13.5px; color: #1e40af; line-height: 1.5;">
+                  <strong>Action Required:</strong> A UPI collect request has been dispatched to <strong>${escapeHtml(upiId)}</strong> for your trading account. Please authorize the credit below.
+                </p>
+              </div>
+            </td>
+          </tr>
+
+          <!-- Hero Amount Card -->
+          <tr>
+            <td style="padding: 14px 30px 20px 30px;">
+              <div style="background-color: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 20px; text-align: center;">
+                <div style="font-size: 11.5px; text-transform: uppercase; color: #047857; font-weight: 700; letter-spacing: 1px;">
+                  DEPOSIT AMOUNT TO CREDIT
+                </div>
+                <div style="font-size: 34px; font-weight: 800; color: #065f46; margin: 6px 0 2px 0;">
+                  ₹${amountText}
+                </div>
+                <div style="font-size: 12px; color: #059669; font-weight: 500;">
+                  ⚡ Real-Time Margin Credit &bull; Zero Brokerage Transfer
+                </div>
+              </div>
+            </td>
+          </tr>
+
+          <!-- Structured Details Table -->
+          <tr>
+            <td style="padding: 0 30px 20px 30px;">
+              <table width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px 18px;">
+                <tr>
+                  <td style="padding: 9px 0; font-size: 13px; color: #64748b; border-bottom: 1px solid #e2e8f0;">Reference ID</td>
+                  <td align="right" style="padding: 9px 0; font-size: 13px; font-weight: 600; color: #0f172a; font-family: monospace; border-bottom: 1px solid #e2e8f0;">${escapeHtml(referenceId)}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 9px 0; font-size: 13px; color: #64748b; border-bottom: 1px solid #e2e8f0;">Target Account</td>
+                  <td align="right" style="padding: 9px 0; font-size: 13px; font-weight: 600; color: #0f172a; border-bottom: 1px solid #e2e8f0;">Equity &amp; F&amp;O Margin</td>
+                </tr>
+                <tr>
+                  <td style="padding: 9px 0; font-size: 13px; color: #64748b; border-bottom: 1px solid #e2e8f0;">Payer UPI ID</td>
+                  <td align="right" style="padding: 9px 0; font-size: 13px; font-weight: 600; color: #0f172a; border-bottom: 1px solid #e2e8f0;">${escapeHtml(upiId)}</td>
+                </tr>
+                <tr>
+                  <td style="padding: 9px 0; font-size: 13px; color: #64748b;">Transfer Type</td>
+                  <td align="right" style="padding: 9px 0; font-size: 13px; font-weight: 600; color: #16a34a;">Instant Zero-Cost UPI</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- Interactive CTA Buttons -->
+          <tr>
+            <td style="padding: 10px 30px 24px 30px; text-align: center;">
+              <table cellpadding="0" cellspacing="0" border="0" align="center" style="margin: 0 auto;">
+                <tr>
+                  <td align="center" style="padding-right: 8px;">
+                    <a href="${escapeHtml(approveUrl)}" target="_blank" style="display: inline-block; background-color: #16a34a; color: #ffffff !important; font-size: 14px; font-weight: 600; text-decoration: none; padding: 13px 26px; border-radius: 5px; box-shadow: 0 2px 6px rgba(22, 163, 74, 0.35); text-align: center; border: 1px solid #15803d;">
+                      &#10003; Approve Payment (₹${amountText})
+                    </a>
+                  </td>
+                  <td align="center" style="padding-left: 8px;">
+                    <a href="${escapeHtml(declineUrl)}" target="_blank" style="display: inline-block; background-color: #ffffff; color: #dc2626 !important; font-size: 13.5px; font-weight: 600; text-decoration: none; padding: 12px 22px; border-radius: 5px; border: 1px solid #fca5a5; text-align: center;">
+                      &#10005; Decline Transfer
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <div style="font-size: 12px; color: #64748b; margin-top: 20px; line-height: 1.5; padding: 0 10px;">
+                Once approved, funds will be instantly credited to your trading margin in real time.
+              </div>
+            </td>
+          </tr>
+
+          <!-- Security Footer -->
+          <tr>
+            <td style="background-color: #fafafa; padding: 18px 25px; font-size: 11.5px; color: #94a3b8; text-align: center; border-top: 1px solid #e2e8f0; line-height: 1.6;">
+              Zerodha Broking Ltd. &bull; Member: NSE, BSE, MCX &bull; SEBI Regn. No.: INZ000031633<br>
+              This is a secure, single-use authorization link valid for 24 hours.
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
   return sendUniversalEmail({
     toEmail,
-    subject: "Review demo deposit " + referenceId,
-    text: "Simulated deposit of INR " + amountText + ". Sign in to the requesting account and confirm: " + approveUrl + " or decline: " + declineUrl,
-    htmlContent: '<h2>Review demo deposit</h2><p>Simulated amount: INR ' + escapeHtml(amountText) +
-      '</p><p>Reference: ' + escapeHtml(referenceId) + '</p><p>No real payment occurs. Sign in to the requesting account to confirm.</p>' +
-      '<a href="' + escapeHtml(approveUrl) + '">Review approval</a> or <a href="' + escapeHtml(declineUrl) + '">Review decline</a>',
-    fromName: "Paper Trading Demo",
+    subject: `Action Required: Approve UPI Fund Deposit of ₹${amountText} (Ref: ${referenceId})`,
+    text: `Zerodha Kite - UPI Fund Deposit Request\nAmount: ₹${amountText}\nReference ID: ${referenceId}\nPayer UPI: ${upiId}\n\nApprove: ${approveUrl}\nDecline: ${declineUrl}\n\nOnce authorized, funds will be instantly credited to your trading margin.`,
+    htmlContent,
+    fromName: "Zerodha Kite",
   });
 }
 
