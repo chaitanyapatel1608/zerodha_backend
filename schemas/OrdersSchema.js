@@ -13,6 +13,9 @@ const OrdersSchema = new Schema({
     name: String,
     qty: Number,
     price: Number,
+    executionFee: Number,
+    displayedPrice: Number,
+    quoteVersion: String,
     mode: String,
     product: String,
     status: {

@@ -14,6 +14,8 @@ const PositionsSchema = new Schema({
     price: { type: Number, default: 0 },
     ltp: { type: Number, default: 0 },
     pnl: { type: Number, default: 0 },
+    cashMarginPaise: Number,
+    collateralMarginPaise: Number,
     realizedPnl: { type: Number, default: 0 },
     unrealizedPnl: { type: Number, default: 0 },
     net: { type: String, default: "+0.00%" },

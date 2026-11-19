@@ -1,3 +1,4 @@
+require("./helpers/integrationSetup");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const path = require("node:path");
@@ -5,8 +6,6 @@ const { execFileSync } = require("node:child_process");
 const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
 
-process.env.NODE_ENV = "test";
-require("dotenv").config();
 
 const { app, startServer, stopServer } = require("../index");
 const { JWT_SECRET } = require("../config/env");
@@ -16,6 +15,7 @@ const { BasketModel } = require("../model/BasketModel");
 const { SipModel } = require("../model/SipModel");
 const { SupportTicketModel } = require("../model/SupportTicketModel");
 const { OtpModel } = require("../model/OtpModel");
+const { GttModel } = require("../model/GttModel");
 const { hashPassword } = require("../utils/security");
 const { encryptField, decryptField, isEncrypted } = require("../utils/encryption");
 
@@ -48,6 +48,7 @@ function makeToken(userId, tokenVersion = 0) {
 }
 
 test.before(async () => {
+  await require("../index").databaseReady;
   await mongoose.connect(process.env.MONGO_URL);
   server = await new Promise((resolve) => {
     const s = app.listen(0, "127.0.0.1", () => resolve(s));
@@ -61,6 +62,31 @@ test.after(async () => {
     await new Promise((resolve) => server.close(resolve));
   }
   await mongoose.disconnect();
+});
+
+test("GTT owner isolation persists authenticated ownership despite a forged body userId", async () => {
+  const owner = `gtt_owner_${Date.now()}`;
+  const victim = `gtt_victim_${Date.now()}`;
+  await UserModel.create([
+    { userId: owner, email: `${owner}@example.com` },
+    { userId: victim, email: `${victim}@example.com` },
+  ]);
+  try {
+    const created = await req("/newGtt", { method: "POST", token: makeToken(owner), body: {
+      userId: victim, symbol: "INFY", qty: 1, triggerPrice: 100, orderPrice: 101,
+    } });
+    assert.equal(created.status, 201);
+    const persisted = await GttModel.findById(created.data.gtt._id).lean();
+    assert.equal(persisted.userId, owner);
+    const victimList = await req("/allGtt", { token: makeToken(victim) });
+    assert.equal(victimList.status, 200);
+    assert.equal(victimList.data.length, 0);
+    const cancel = await req("/cancelGtt", { method: "POST", token: makeToken(victim), body: { id: persisted._id } });
+    assert.equal(cancel.status, 404);
+  } finally {
+    await GttModel.deleteMany({ userId: { $in: [owner, victim] } });
+    await UserModel.deleteMany({ userId: { $in: [owner, victim] } });
+  }
 });
 
 test("VULN-01 ReDoS: /masterInstruments escapes regex metacharacters and rejects oversized queries", async () => {
@@ -179,6 +205,8 @@ test("VULN-04 CDSL E-DIS: CNC SELL requires server-side CDSL authorization and b
     assert.equal(verifyRes.status, 200);
     assert.ok(verifyRes.data?.cdslAuthorizedUntil);
 
+    await mongoose.connection.db.collection("funds").updateOne({ userId: uid },
+      { $set: { "equity.availableMargin": "20.00", "equity.availableCash": "20.00", "equity.usedMargin": "7,500.00" } }, { upsert: true });
     const allowedSell = await req("/newOrder", {
       method: "POST",
       token: tok,

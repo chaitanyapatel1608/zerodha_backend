@@ -2,14 +2,17 @@ const mongoose = require("mongoose");
 const { Schema } = mongoose;
 
 const ExecutionLogSchema = new Schema({
+  scheduledAt: Date,
+  legs: [Schema.Types.Mixed],
   executedAt: { type: Date, default: Date.now },
   ordersCount: { type: Number, default: 0 },
   amountDebited: { type: Number, default: 0 },
-  status: { type: String, enum: ["SUCCESS", "FAILED_INSUFFICIENT_FUNDS"], required: true },
+  status: { type: String, enum: ["SUCCESS", "FAILED_INSUFFICIENT_FUNDS", "PARTIAL", "SKIPPED"], required: true },
   failureReason: { type: String },
 });
 
 const SipInstrumentSchema = new Schema({
+  budget: Number,
   symbol: { type: String, required: true },
   name: { type: String },
   qty: { type: Number, required: true, default: 1 },
@@ -63,7 +66,7 @@ const SipSchema = new Schema(
     },
     scheduleTime: {
       type: String,
-      default: "09:30", // e.g. "09:30", "11:00", "14:30"
+      default: "10:00", // e.g. "09:30", "11:00", "14:30"
     },
     status: {
       type: String,
@@ -87,6 +90,7 @@ const SipSchema = new Schema(
       type: Number,
       default: 0,
     },
+    installment: Schema.Types.Mixed,
     executionLogs: [ExecutionLogSchema],
   },
   { timestamps: true }

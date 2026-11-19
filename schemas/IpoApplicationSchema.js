@@ -74,8 +74,6 @@ const IpoApplicationSchema = new Schema(
     },
     mandateToken: {
       type: String,
-      required: true,
-      unique: true,
     },
     mandateExpiresAt: { type: Date },
     status: {
@@ -103,5 +101,6 @@ const IpoApplicationSchema = new Schema(
 );
 
 IpoApplicationSchema.index({ userId: 1, ipoSymbol: 1 });
+IpoApplicationSchema.index({ mandateToken: 1 }, { unique: true, partialFilterExpression: { mandateToken: { $type: "string" } } });
 
 module.exports = { IpoApplicationSchema };

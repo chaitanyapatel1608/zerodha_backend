@@ -2,8 +2,8 @@ const mongoose = require("mongoose");
 
 /**
  * Executes multi-document DB mutations inside a MongoDB ACID transaction session
- * when backed by a Replica Set (MongoDB Atlas), with graceful fallback for
- * standalone local development servers.
+ * on a replica set. Never retry a financial operation without a transaction:
+ * standalone development databases must fail closed rather than partially commit.
  */
 async function runInTransaction(workFn) {
   let session = null;
@@ -14,15 +14,6 @@ async function runInTransaction(workFn) {
       result = await workFn(session);
     });
     return result;
-  } catch (err) {
-    const msg = String(err?.message || "");
-    if (
-      msg.includes("Transaction numbers are only allowed on a replica set") ||
-      msg.includes("Sessions are not supported")
-    ) {
-      return await workFn(null);
-    }
-    throw err;
   } finally {
     if (session) {
       await session.endSession().catch(() => {});

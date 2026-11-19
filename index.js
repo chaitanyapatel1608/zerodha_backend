@@ -12,6 +12,7 @@ const {
   MONGO_URL: uri,
   JWT_SECRET,
   PUBLIC_FRONTEND_URL,
+  PUBLIC_DASHBOARD_URL,
   PUBLIC_BACKEND_URL,
   ALLOWED_ORIGINS: allowedOrigins,
 } = require("./config/env");
@@ -38,6 +39,7 @@ const {
 const { escapeHtml, renderConfirmationPage } = require("./utils/html");
 const { decryptField } = require("./utils/encryption");
 const { withUserLock, acquireDistributedLock, releaseDistributedLock } = require("./utils/locks");
+const { executionQuote, orderValuePaise } = require("./utils/executionQuote");
 const { runInTransaction } = require("./utils/transactions");
 const healthRoutes = require("./routes/healthRoutes");
 const adminRoutes = require("./routes/adminRoutes");
@@ -59,6 +61,8 @@ const { AuctionOfferModel } = require("./model/AuctionOfferModel");
 const { SseIpoModel } = require("./model/SseIpoModel");
 const { SseApplicationModel } = require("./model/SseApplicationModel");
 const { UserModel } = require("./model/UserModel");
+const reservations = require("./utils/reservations");
+const gttExecution = require("./utils/gttExecution");
 const { GttModel } = require("./model/GttModel");
 const { BasketModel } = require("./model/BasketModel");
 const { SipModel } = require("./model/SipModel");
@@ -171,13 +175,15 @@ function clearAuthCookies(res, req) {
 }
 
 // MongoDB Connection
-mongoose
+const databaseReady = uri ? mongoose
   .connect(uri)
-  .then(() => {
+  .then(async () => {
     logger.info("db_connected");
-    seedCatalogsToDb();
+    await seedCatalogsToDb();
   })
-  .catch((err) => logger.error("db_connection_error", { message: err.message }));
+  .catch((err) => { logger.error("db_connection_error", { message: err.message }); throw err; }) : Promise.resolve();
+// Record startup failures without creating an unhandled rejection before the server awaits readiness.
+databaseReady.catch(() => {});
 
 // ==========================================
 // Authentication Routes (Passwordless OTP)
@@ -290,7 +296,7 @@ app.post("/send-otp", otpLimiter, async (req, res) => {
 
     // Dispatch live email via Nodemailer
     const emailResult = await sendOtpEmail(normalizedEmail, generatedOtp);
-    console.log(`🔑 [LOGIN OTP DISPATCHED] Email: ${normalizedEmail} | OTP: ${generatedOtp} | Email Delivered: ${emailResult.delivered}`);
+    logger.info("login_otp_dispatched", { delivered: emailResult.delivered });
 
     return res.status(200).json({
       success: true,
@@ -674,185 +680,23 @@ app.get("/allPositions", requireAuth, async (req, res) => {
 // POSITIONS ENGINE (SQUARE OFF & CONVERT)
 // ==========================================
 
-// 1. Square Off Single Position (MIS or Overnight)
-app.post("/squareOffPosition", requireAuth, tradeFundsLimiter, async (req, res) => {
-  try {
-    const userId = getAuthenticatedUserId(req);
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "User authentication required" });
+const { tradePosition } = require("./utils/tradePosition");
+const { closePositions } = require("./utils/closePositions");
+for (const [route, bulk] of [["/squareOffPosition", false], ["/squareOffAllPositions", true]]) {
+  app.post(route, requireAuth, tradeFundsLimiter, async (req, res) => {
+    const filter = { userId: getAuthenticatedUserId(req) };
+    if (!bulk) {
+      if (!isValidObjectId(req.body?.positionId)) return res.status(400).json({ success: false, message: "Invalid position ID." });
+      filter._id = req.body.positionId;
     }
-    const { positionId, exitPrice } = req.body;
-    const position = await PositionsModel.findOne({ _id: positionId, userId });
-    if (!position || position.qty === 0) {
-      return res.status(400).json({ success: false, message: "Position not found or already squared off." });
-    }
-
-    const sym = position.instrument || position.name;
-    const ltp = Number(exitPrice) || position.ltp || position.price || position.avg;
-    const qty = position.qty;
-    const avg = position.avg || ltp;
-
-    // Realized P&L calculation:
-    // Long (qty > 0): (ltp - avg) * qty
-    // Short (qty < 0): (avg - ltp) * Math.abs(qty)
-    const realizedPnl = Number((qty > 0 ? (ltp - avg) * qty : (avg - ltp) * Math.abs(qty)).toFixed(2));
-
-    // Release margin and add/deduct P&L from funds
-    const funds = await getOrCreateUserFunds(userId);
-    if (funds) {
-      const orderCost = Math.abs(qty) * avg;
-      const marginBlocked = (position.product || "MIS") === "MIS" ? orderCost * 0.2 : orderCost;
-      let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
-      let currentUsed = parseFloat(funds.equity.usedMargin.replace(/,/g, "")) || 0;
-
-      currentAvailable += (marginBlocked + realizedPnl);
-      currentUsed = Math.max(0, currentUsed - marginBlocked);
-
-      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
-      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-      await funds.save();
-    }
-
-    // Record square off order in OrdersModel
-    const exitMode = qty > 0 ? "SELL" : "BUY";
-    const exitOrder = new OrdersModel({
-      userId,
-      name: sym,
-      qty: Math.abs(qty),
-      price: ltp,
-      mode: exitMode,
-      product: position.product || "MIS",
-      status: "COMPLETE",
-      tag: "SQUARE_OFF",
-    });
-    await exitOrder.save();
-
-    // Mark position as closed with final realized P&L
-    position.realizedPnl = Number(((position.realizedPnl || 0) + realizedPnl).toFixed(2));
-    position.pnl = position.realizedPnl;
-    position.unrealizedPnl = 0;
-    position.qty = 0;
-    position.ltp = ltp;
-    position.status = "CLOSED";
-    position.closedAt = new Date();
-    position.isProfit = position.realizedPnl >= 0;
-    position.isLoss = position.realizedPnl < 0;
-    await position.save();
-
-    // Send in-app notification
     try {
-      await createNotification({
-        userId,
-        type: "ORDER",
-        category: "TRADE",
-        title: `Position Squared Off: ${sym}`,
-        description: `Closed ${Math.abs(qty)} ${sym} (${position.product}) @ ₹${ltp.toFixed(2)}. Realized P&L: ${realizedPnl >= 0 ? "+" : ""}₹${realizedPnl.toFixed(2)}`,
-        status: "SUCCESS",
-      });
-    } catch (e) {}
-
-    res.status(200).json({
-      success: true,
-      message: `Position in ${sym} squared off successfully! Realized P&L: ${realizedPnl >= 0 ? "+" : ""}₹${realizedPnl.toFixed(2)}`,
-      position,
-      realizedPnl,
-    });
-  } catch (error) {
-    console.error("Error squaring off position:", error);
-    res.status(500).json({ success: false, message: "Failed to square off position." });
-  }
-});
-
-// 2. Square Off All Open Positions (Emergency / 15:20 RMS Square Off)
-app.post("/squareOffAllPositions", requireAuth, tradeFundsLimiter, async (req, res) => {
-  try {
-    const userId = getAuthenticatedUserId(req);
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "User authentication required" });
+      const result = await closePositions(filter, { bulk });
+      return res.json({ success: true, message: "Position close completed.", ...result });
+    } catch (err) {
+      return res.status(err.closeStatus || 500).json({ success: false, message: err.closeStatus ? err.message : "Position close failed." });
     }
-    const openPositions = await PositionsModel.find({ userId, qty: { $ne: 0 } });
-    if (!openPositions || openPositions.length === 0) {
-      return res.status(400).json({ success: false, message: "No open positions to square off." });
-    }
-
-    const funds = await getOrCreateUserFunds(userId);
-    let totalRealized = 0;
-    const closedPositions = [];
-
-    for (const pos of openPositions) {
-      const sym = pos.instrument || pos.name;
-      const ltp = pos.ltp || pos.price || pos.avg;
-      const qty = pos.qty;
-      const avg = pos.avg || ltp;
-      const pnl = Number((qty > 0 ? (ltp - avg) * qty : (avg - ltp) * Math.abs(qty)).toFixed(2));
-      totalRealized += pnl;
-
-      if (funds) {
-        const orderCost = Math.abs(qty) * avg;
-        const marginBlocked = (pos.product || "MIS") === "MIS" ? orderCost * 0.2 : orderCost;
-        let currentAvailable = parseFloat(funds.equity.availableMargin.replace(/,/g, "")) || 0;
-        let currentUsed = parseFloat(funds.equity.usedMargin.replace(/,/g, "")) || 0;
-
-        currentAvailable += (marginBlocked + pnl);
-        currentUsed = Math.max(0, currentUsed - marginBlocked);
-
-        funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-        funds.equity.usedMargin = formatIndianCurrency(currentUsed);
-        funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-      }
-
-      // Exit order log
-      const exitOrder = new OrdersModel({
-        userId,
-        name: sym,
-        qty: Math.abs(qty),
-        price: ltp,
-        mode: qty > 0 ? "SELL" : "BUY",
-        product: pos.product || "MIS",
-        status: "COMPLETE",
-        tag: "RMS_SQUARE_OFF_ALL",
-      });
-      await exitOrder.save();
-
-      pos.realizedPnl = Number(((pos.realizedPnl || 0) + pnl).toFixed(2));
-      pos.pnl = pos.realizedPnl;
-      pos.unrealizedPnl = 0;
-      pos.qty = 0;
-      pos.ltp = ltp;
-      pos.status = "CLOSED";
-      pos.closedAt = new Date();
-      pos.isProfit = pos.realizedPnl >= 0;
-      pos.isLoss = pos.realizedPnl < 0;
-      await pos.save();
-      closedPositions.push(pos);
-    }
-
-    if (funds) await funds.save();
-
-    try {
-      await createNotification({
-        userId,
-        type: "ORDER",
-        category: "SYSTEM",
-        title: `All Positions Squared Off (${closedPositions.length})`,
-        description: `Emergency square-off executed for ${closedPositions.length} open position(s). Total Day Realized P&L: ${totalRealized >= 0 ? "+" : ""}₹${totalRealized.toFixed(2)}.`,
-        status: "SUCCESS",
-      });
-    } catch (e) {}
-
-    res.status(200).json({
-      success: true,
-      message: `All ${closedPositions.length} open positions squared off at market price! Total Realized P&L: ${totalRealized >= 0 ? "+" : ""}₹${totalRealized.toFixed(2)}`,
-      count: closedPositions.length,
-      totalRealized,
-      positions: closedPositions,
-    });
-  } catch (error) {
-    console.error("Error squaring off all positions:", error);
-    res.status(500).json({ success: false, message: "Failed to square off all positions." });
-  }
-});
+  });
+}
 
 // 3. Convert Position (MIS <-> CNC/NRML)
 app.post("/convertPosition", requireAuth, async (req, res) => {
@@ -880,6 +724,9 @@ app.post("/convertPosition", requireAuth, async (req, res) => {
     const orderCost = qty * avg;
     const funds = await getOrCreateUserFunds(userId);
 
+    if (toPaise(funds.equity.totalCollateral) || position.collateralMarginPaise || (position.qty < 0 && desiredProduct === "CNC")) {
+      return res.status(409).json({ success: false, message: "Conversion requires verified cash funding and an eligible position." });
+    }
     if (currentProduct === "MIS" && (desiredProduct === "CNC" || desiredProduct === "NRML")) {
       // MIS (20%) -> CNC/NRML (100%): Requires additional 80% margin!
       const additionalMarginRequired = orderCost * 0.8;
@@ -959,6 +806,8 @@ app.post("/convertPosition", requireAuth, async (req, res) => {
       }
     }
 
+    position.cashMarginPaise = Math.round(qty * avg * (desiredProduct === "MIS" ? 20 : 100));
+    position.collateralMarginPaise = 0;
     position.product = desiredProduct;
     position.convertedAt = new Date();
     await position.save();
@@ -1060,12 +909,28 @@ async function getOrCreateUserFunds(userId, session = null) {
 }
 
 // Unified Order Execution Helper
-async function executeOrderInternal({ name, qty, price, mode = "BUY", product = "CNC", userId }) {
-  const numQty = Number(qty);
-  const numPrice = Number(price);
+async function pledgedUnits(userId, symbol, session) {
+  const [result] = await PledgedCollateralModel.aggregate([
+    { $match: { userId, symbol, status: "PLEDGED" } },
+    { $group: { _id: null, quantity: { $sum: "$pledgedQty" } } },
+  ]).session(session);
+  return (result?.quantity || 0) + await reservations.reservedShares(userId, symbol, session);
+}
 
-  if (!name || isNaN(numQty) || numQty <= 0 || isNaN(numPrice) || numPrice <= 0) {
-    return { success: false, message: "Valid instrument name, positive quantity, and price are required." };
+async function executeOrderInternal({ name, qty, price, mode = "BUY", product = "CNC", userId }, outerSession = null) {
+  const numQty = Number(qty);
+  const displayedPrice = Number(price);
+  if (typeof name !== "string" || !name.trim() || !Number.isSafeInteger(numQty) ||
+      numQty <= 0 || numQty > 10000 || !Number.isFinite(displayedPrice) || displayedPrice <= 0) {
+    return { success: false, message: "A symbol, valid displayed quote and 1 to 10,000 whole units are required." };
+  }
+  name = name.trim().toUpperCase();
+  const quote = await executionQuote(name, outerSession);
+  if (!quote) return { success: false, code: "QUOTE_UNAVAILABLE", message: "No server quote available for this instrument." };
+  const numPrice = quote.price;
+  const orderCostPaise = orderValuePaise(numQty, numPrice);
+  if (orderCostPaise === null || orderCostPaise <= 0) {
+    return { success: false, code: "ORDER_VALUE_LIMIT", message: "Order value must be positive and within 10 lakh." };
   }
 
   // 🛡️ Pre-Trade Risk Engine: Segments & Kill Switch Enforcement
@@ -1109,7 +974,7 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
       }
     }
   } catch (segErr) {
-    console.warn("Segment validation warning:", segErr.message);
+    throw segErr;
   }
 
   const orderMode = mode.toUpperCase();
@@ -1117,12 +982,11 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
   if (!["BUY", "SELL"].includes(orderMode) || !["CNC", "MIS", "NRML"].includes(orderProduct)) {
     return { success: false, message: "Invalid order mode or product type." };
   }
-  const orderCostPaise = Math.round(numQty * toPaise(numPrice));
+
   const marginRequiredPaise = orderProduct === "MIS" ? Math.round(orderCostPaise * 0.2) : orderCostPaise;
   const orderCost = fromPaise(orderCostPaise);
 
-  return await withUserLock(`trade:${userId}`, async () =>
-    runInTransaction(async (session) => {
+  const applyOrder = async session => {
       const sOpt = session ? { session } : undefined;
       let funds = await getOrCreateUserFunds(userId, session);
       if (!funds) {
@@ -1136,8 +1000,12 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
       let currentAvailablePaise = toPaise(funds.equity.availableMargin);
       let currentUsedPaise = toPaise(funds.equity.usedMargin);
 
-      if (orderMode === "BUY") {
-        if (currentAvailablePaise < marginRequiredPaise) {
+      const freeCash = toPaise(funds.equity.availableCash);
+      if (orderProduct !== "CNC") {
+        const result = await tradePosition({ userId, name, product: orderProduct, side: orderMode, units: numQty, price: numPrice, funds, session });
+        if (!result.success) return result;
+      } else if (orderMode === "BUY") {
+        if (Math.min(currentAvailablePaise, freeCash) < marginRequiredPaise + 2000) {
           return {
             success: false,
             code: "INSUFFICIENT_MARGIN",
@@ -1145,18 +1013,18 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
           };
         }
 
-        currentAvailablePaise = subPaise(currentAvailablePaise, marginRequiredPaise);
+        currentAvailablePaise = subPaise(currentAvailablePaise, marginRequiredPaise + 2000);
         currentUsedPaise = addPaise(currentUsedPaise, marginRequiredPaise);
         funds.equity.availableMargin = formatPaiseINR(currentAvailablePaise);
         funds.equity.usedMargin = formatPaiseINR(currentUsedPaise);
-        funds.equity.availableCash = formatPaiseINR(currentAvailablePaise);
+        funds.equity.availableCash = formatPaiseINR(freeCash - marginRequiredPaise - 2000);
         await funds.save(sOpt);
 
-    if (orderProduct === "CNC") {
+
       let existingHolding = await HoldingsModel.findOne({
         userId,
         $or: [{ name }, { instrument: name }],
-      });
+      }).session(session);
 
       if (existingHolding) {
         const totalShares = existingHolding.qty + numQty;
@@ -1170,7 +1038,7 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
         existingHolding.pnl = Number((existingHolding.curVal - totalShares * existingHolding.avg).toFixed(2));
         existingHolding.net = `${existingHolding.pnl >= 0 ? "+" : ""}${((existingHolding.pnl / (totalShares * existingHolding.avg)) * 100).toFixed(2)}%`;
         existingHolding.isProfit = existingHolding.pnl >= 0;
-        await existingHolding.save();
+        await existingHolding.save(sOpt);
       } else {
         const newHolding = new HoldingsModel({
           userId,
@@ -1190,79 +1058,12 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
           isProfit: true,
           isDayProfit: true,
         });
-        await newHolding.save();
+        await newHolding.save(sOpt);
       }
-    } else {
-      let existingPosition = await PositionsModel.findOne({
-        userId,
-        $or: [{ name }, { instrument: name }],
-        product: orderProduct,
-      });
-
-      if (existingPosition) {
-        if (existingPosition.qty === 0) {
-          existingPosition.qty = numQty;
-          existingPosition.avg = numPrice;
-          existingPosition.price = numPrice;
-          existingPosition.ltp = numPrice;
-          existingPosition.status = "OPEN";
-          existingPosition.closedAt = null;
-        } else if (existingPosition.qty > 0) {
-          const totalShares = existingPosition.qty + numQty;
-          const totalCost = existingPosition.qty * (existingPosition.avg || existingPosition.price) + numQty * numPrice;
-          existingPosition.avg = Number((totalCost / totalShares).toFixed(2));
-          existingPosition.qty = totalShares;
-          existingPosition.price = numPrice;
-          existingPosition.ltp = numPrice;
-          existingPosition.status = "OPEN";
-          existingPosition.closedAt = null;
-        } else {
-          // Covering short position
-          const netQty = existingPosition.qty + numQty;
-          if (netQty > 0) {
-            existingPosition.avg = numPrice;
-            existingPosition.qty = netQty;
-            existingPosition.status = "OPEN";
-            existingPosition.closedAt = null;
-          } else if (netQty === 0) {
-            existingPosition.qty = 0;
-            existingPosition.status = "CLOSED";
-            existingPosition.closedAt = new Date();
-          } else {
-            existingPosition.qty = netQty;
-            existingPosition.status = "OPEN";
-            existingPosition.closedAt = null;
-          }
-          existingPosition.price = numPrice;
-          existingPosition.ltp = numPrice;
-        }
-        await existingPosition.save();
-      } else {
-        const newPosition = new PositionsModel({
-          userId,
-          product: orderProduct || "MIS",
-          name,
-          instrument: name,
-          qty: numQty,
-          avg: numPrice,
-          price: numPrice,
-          ltp: numPrice,
-          pnl: 0,
-          net: "+0.00%",
-          day: "+0.00%",
-          chg: "+0.00%",
-          isLoss: false,
-          isProfit: true,
-          status: "OPEN",
-          closedAt: null,
-        });
-        await newPosition.save();
-      }
-    }
   } else if (orderMode === "SELL") {
-    if (orderProduct === "CNC") {
+
       // Server-side CDSL E-DIS authorization gate for CNC Demat sell orders
-      const seller = await UserModel.findOne({ userId }).select("cdslAuthorizedUntil");
+      const seller = await UserModel.findOne({ userId }).select("cdslAuthorizedUntil").session(session);
       if (!seller || !seller.cdslAuthorizedUntil || new Date() > new Date(seller.cdslAuthorizedUntil)) {
         return {
           success: false,
@@ -1272,12 +1073,14 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
         };
       }
 
+    if (freeCash < 2000) return { success: false, code: "INSUFFICIENT_MARGIN", message: "Insufficient cash for the execution fee." };
       let existingHolding = await HoldingsModel.findOne({
         userId,
         $or: [{ name }, { instrument: name }],
-      });
+      }).session(session);
 
-      if (!existingHolding || existingHolding.qty < numQty) {
+      const reserved = await pledgedUnits(userId, name, session);
+      if (!existingHolding || existingHolding.qty - reserved < numQty) {
         return {
           success: false,
           code: "INSUFFICIENT_HOLDINGS",
@@ -1287,88 +1090,20 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
 
       existingHolding.qty -= numQty;
       if (existingHolding.qty <= 0) {
-        await HoldingsModel.deleteOne({ _id: existingHolding._id });
+        await HoldingsModel.deleteOne({ _id: existingHolding._id }, sOpt);
       } else {
         existingHolding.curVal = Number((existingHolding.qty * numPrice).toFixed(2));
         existingHolding.pnl = Number((existingHolding.curVal - existingHolding.qty * existingHolding.avg).toFixed(2));
-        await existingHolding.save();
+        await existingHolding.save(sOpt);
       }
 
-      const proceedsPaise = Math.round(numQty * toPaise(numPrice));
-      currentAvailablePaise = addPaise(currentAvailablePaise, proceedsPaise);
-      currentUsedPaise = Math.max(0, subPaise(currentUsedPaise, proceedsPaise));
+      const proceedsPaise = orderCostPaise;
+      currentAvailablePaise = addPaise(currentAvailablePaise, proceedsPaise - 2000);
+      currentUsedPaise = Math.max(0, subPaise(currentUsedPaise, Math.round(existingHolding.avg * numQty * 100)));
       funds.equity.availableMargin = formatPaiseINR(currentAvailablePaise);
       funds.equity.usedMargin = formatPaiseINR(currentUsedPaise);
-      funds.equity.availableCash = formatPaiseINR(currentAvailablePaise);
+      funds.equity.availableCash = formatPaiseINR(freeCash + proceedsPaise - 2000);
       await funds.save(sOpt);
-    } else {
-      let existingPosition = await PositionsModel.findOne({
-        userId,
-        $or: [{ name }, { instrument: name }],
-        product: orderProduct,
-      });
-
-      if (existingPosition) {
-        if (existingPosition.qty > 0) {
-          const netQty = existingPosition.qty - numQty;
-          if (netQty === 0) {
-            existingPosition.qty = 0;
-            existingPosition.status = "CLOSED";
-            existingPosition.closedAt = new Date();
-          } else if (netQty > 0) {
-            existingPosition.qty = netQty;
-            existingPosition.status = "OPEN";
-            existingPosition.closedAt = null;
-          } else {
-            // Flipped to short
-            existingPosition.avg = numPrice;
-            existingPosition.qty = netQty;
-            existingPosition.status = "OPEN";
-            existingPosition.closedAt = null;
-          }
-        } else {
-          // Already short or 0, increase short position
-          const priorShares = Math.abs(existingPosition.qty);
-          const totalShares = priorShares + numQty;
-          const totalCost = priorShares * (existingPosition.avg || existingPosition.price) + numQty * numPrice;
-          existingPosition.avg = Number((totalCost / totalShares).toFixed(2));
-          existingPosition.qty = -totalShares;
-          existingPosition.status = "OPEN";
-          existingPosition.closedAt = null;
-        }
-        existingPosition.price = numPrice;
-        existingPosition.ltp = numPrice;
-        await existingPosition.save();
-      } else {
-        // New Short Intraday / Overnight Position
-        const newPosition = new PositionsModel({
-          userId,
-          product: orderProduct || "MIS",
-          name,
-          instrument: name,
-          qty: -numQty,
-          avg: numPrice,
-          price: numPrice,
-          ltp: numPrice,
-          pnl: 0,
-          net: "+0.00%",
-          day: "+0.00%",
-          chg: "+0.00%",
-          isLoss: false,
-          isProfit: true,
-          status: "OPEN",
-          closedAt: null,
-        });
-        await newPosition.save();
-      }
-
-      currentAvailablePaise = addPaise(currentAvailablePaise, marginRequiredPaise);
-      currentUsedPaise = Math.max(0, subPaise(currentUsedPaise, marginRequiredPaise));
-      funds.equity.availableMargin = formatPaiseINR(currentAvailablePaise);
-      funds.equity.usedMargin = formatPaiseINR(currentUsedPaise);
-      funds.equity.availableCash = formatPaiseINR(currentAvailablePaise);
-      await funds.save(sOpt);
-    }
   }
 
   const newOrder = new OrdersModel({
@@ -1376,6 +1111,9 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
     name,
     qty: numQty,
     price: numPrice,
+    executionFee: 20,
+    displayedPrice,
+    quoteVersion: quote.version,
     mode: orderMode,
     product: orderProduct,
     status: "COMPLETE",
@@ -1383,14 +1121,13 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
   });
   const savedOrder = await newOrder.save(sOpt);
 
-  // Real-Time Dynamic Notification Dispatch
-  try {
-    await createNotification({
+  // Persist the execution notification in the same transaction as the order.
+  const notification = new NotificationModel({
       userId,
       type: "ORDER",
       category: "EXECUTION",
       title: `Order Executed - ${orderMode} ${numQty} ${name}`,
-      description: `${orderMode} ${numQty} ${name} @ ₹${numPrice.toFixed(2)} (${orderProduct}) executed at NSE successfully.`,
+      description: `${orderMode} ${numQty} ${name} @ ₹${numPrice.toFixed(2)} (${orderProduct}) executed in the paper-trading simulator.`,
       metadata: {
         orderId: savedOrder._id ? savedOrder._id.toString() : "",
         symbol: name,
@@ -1400,18 +1137,17 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
         product: orderProduct,
         actionUrl: "/orders",
       },
-    });
-  } catch (notifErr) {
-    console.error("Failed to dispatch order notification:", notifErr.message);
-  }
+  });
+  await notification.save(sOpt);
 
   return {
     success: true,
     order: savedOrder,
     funds: funds.equity,
   };
-    })
-  );
+  };
+  if (outerSession) return applyOrder(outerSession);
+  return withUserLock(`trade:${userId}`, () => runInTransaction(applyOrder));
 }
 
 // Integer-paise formatIndianCurrency is imported from ./utils/money
@@ -1421,7 +1157,9 @@ app.post("/newOrder", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const { name, qty, price, mode = "BUY", product = "CNC" } = req.body;
     const userId = getAuthenticatedUserId(req);
-    const result = await executeOrderInternal({ name, qty, price, mode, product, userId });
+    const input = { name: typeof name === "string" ? name.trim().toUpperCase() : name, qty: Number(qty), price: Number(price), mode, product, userId };
+    const result = req.body.orderType === "LIMIT" ? await reservations.place(input, executeOrderInternal)
+      : await executeOrderInternal(input);
     if (!result.success) {
       const status = result.code === "CDSL_AUTH_REQUIRED" ? 403 : 400;
       return res.status(status).json(result);
@@ -1429,7 +1167,7 @@ app.post("/newOrder", requireAuth, tradeFundsLimiter, async (req, res) => {
     console.log(`⚡ [ORDER EXECUTED] ${mode} ${qty} ${name} @ ₹${price} (${product}) for ${userId}`);
     return res.status(201).json({
       success: true,
-      message: `Order executed: ${mode} ${qty} ${name} @ ₹${price} (${product})`,
+      message: result.order.status === "PENDING" ? "Limit order pending with funds reserved." : `Order executed: ${mode} ${qty} ${name} @ ₹${result.order.price} (${product})`,
       order: result.order,
       funds: result.funds,
     });
@@ -1440,6 +1178,12 @@ app.post("/newOrder", requireAuth, tradeFundsLimiter, async (req, res) => {
     logger.error("order_engine_error", { error: error.message });
     return res.status(500).json({ success: false, message: "Internal server error processing order" });
   }
+});
+
+app.post("/cancelOrder/:id", requireAuth, tradeFundsLimiter, async (req, res) => {
+  if (!isValidObjectId(req.params.id)) return res.status(400).json({ success: false });
+  const cancelled = await reservations.cancel(req.params.id, getAuthenticatedUserId(req));
+  res.status(cancelled ? 200 : 409).json({ success: cancelled });
 });
 
 app.get("/allWatchlist", async (req, res) => {
@@ -1978,8 +1722,8 @@ app.get("/allGtt", requireAuth, async (req, res) => {
 
 app.post("/newGtt", requireAuth, async (req, res) => {
   try {
+    const userId = getAuthenticatedUserId(req);
     const {
-      userId = getAuthenticatedUserId(req),
       symbol,
       exchange = "NSE",
       type = "SINGLE",
@@ -1994,7 +1738,11 @@ app.post("/newGtt", requireAuth, async (req, res) => {
       targetPrice,
     } = req.body;
 
-    if (!symbol || !qty || Number(qty) <= 0) {
+    const validPrice = value => Number.isFinite(Number(value)) && Number(value) > 0;
+    const prices = type === "SINGLE" ? [triggerPrice, orderPrice] : [stoplossTrigger, stoplossPrice, targetTrigger, targetPrice];
+    if (typeof symbol !== "string" || !symbol.trim() || !Number.isSafeInteger(Number(qty)) || Number(qty) < 1 || Number(qty) > 10000 ||
+        !["BUY","SELL"].includes(transactionType) || !["CNC","MIS","NRML"].includes(product) ||
+        !["SINGLE","OCO"].includes(type) || !prices.every(validPrice)) {
       return res.status(400).json({
         success: false,
         message: "Valid symbol and quantity are required for GTT order.",
@@ -2023,6 +1771,7 @@ app.post("/newGtt", requireAuth, async (req, res) => {
       transactionType: transactionType.toUpperCase(),
       product: product.toUpperCase(),
       qty: Number(qty),
+      triggerDirection: req.body.triggerDirection || (transactionType === "BUY" ? "BELOW" : "ABOVE"),
       triggerPrice: triggerPrice ? Number(triggerPrice) : undefined,
       orderPrice: orderPrice ? Number(orderPrice) : undefined,
       stoplossTrigger: stoplossTrigger ? Number(stoplossTrigger) : undefined,
@@ -2033,12 +1782,13 @@ app.post("/newGtt", requireAuth, async (req, res) => {
     });
 
     const savedGtt = await newGtt.save();
+    const evaluated = await gttExecution.evaluate(savedGtt._id, userId, executeOrderInternal);
     console.log(`🎯 [GTT CREATED] ${type} on ${symbol} for ${userId}`);
 
     res.status(201).json({
       success: true,
       message: `GTT trigger order created for ${symbol}`,
-      gtt: savedGtt,
+      gtt: evaluated.gtt || savedGtt,
     });
   } catch (error) {
     console.error("Error creating GTT:", error);
@@ -2057,7 +1807,7 @@ app.post("/cancelGtt", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: "GTT ID required" });
     }
     const updated = await GttModel.findOneAndUpdate(
-      { _id: id, userId },
+      { _id: id, userId, status: "ACTIVE" },
       { status: "CANCELLED" },
       { new: true }
     );
@@ -2078,32 +1828,9 @@ app.post("/triggerGtt", requireAuth, async (req, res) => {
       return res.status(401).json({ success: false, message: "Authentication required" });
     }
     const { id } = req.body;
-    const gtt = await GttModel.findOne({ _id: id, userId });
-    if (!gtt || gtt.status !== "ACTIVE") {
-      return res.status(404).json({ success: false, message: "GTT not found or already triggered" });
-    }
-
-    // Place the order
-    const priceToExecute = gtt.type === "SINGLE" ? gtt.orderPrice : (gtt.targetPrice || gtt.stoplossPrice);
-    const orderRes = await executeOrderInternal({
-      name: gtt.symbol,
-      qty: gtt.qty,
-      price: priceToExecute,
-      mode: gtt.transactionType,
-      product: gtt.product,
-      userId: gtt.userId,
-    });
-
-    if (orderRes.success) {
-      gtt.status = "TRIGGERED";
-      gtt.triggeredAt = new Date();
-      await gtt.save();
-      return res.status(200).json({ success: true, message: "GTT triggered and executed successfully!", order: orderRes.order });
-    } else {
-      gtt.status = "REJECTED";
-      await gtt.save();
-      return res.status(400).json({ success: false, message: "GTT execution rejected: " + orderRes.message });
-    }
+    if (!isValidObjectId(id)) return res.status(400).json({ message: "Invalid GTT ID." });
+    const result = await gttExecution.evaluate(id, userId, executeOrderInternal);
+    return res.status(result.status).json({ ...result, success: result.status === 200 });
   } catch (error) {
     console.error("Error triggering GTT:", error);
     res.status(500).json({ success: false, message: "Internal server error triggering GTT" });
@@ -2509,11 +2236,34 @@ app.post("/notifications/clearAll", requireAuth, async (req, res) => {
 // ============================================================================
 
 // 1. Initiate Fund Deposit (Dispatches Interactive UPI Collect Email)
+async function dispatchDepositApproval(tx, toEmail) {
+  const action = PUBLIC_BACKEND_URL + "/fundDeposit/action?token=" + tx.approvalToken;
+  const outcome = await sendFundDepositEmail({ toEmail, amount: tx.amount, upiId: tx.upiId, referenceId: tx.referenceId,
+    approveUrl: action + "&decision=APPROVE", declineUrl: action + "&decision=REJECT" });
+  return Boolean(outcome?.delivered);
+}
+
+app.post(["/fundDeposit/:id/resend", "/fundDeposit/:id/cancel"], requireAuth, tradeFundsLimiter, async (req, res) => {
+  const { id } = req.params;
+  if (!isValidObjectId(id)) return res.status(400).json({ message: "Invalid deposit identifier." });
+  const userId = getAuthenticatedUserId(req);
+  const cancel = req.path.endsWith("/cancel");
+  const update = cancel ? { status: "REJECTED", approvalToken: null, completedAt: new Date(), remarks: "Cancelled by owner" }
+    : { approvalToken: crypto.randomBytes(32).toString("hex"), approvalExpiresAt: new Date(Date.now() + 86400000) };
+  const tx = await FundsTransactionModel.findOneAndUpdate({ _id: id, userId, type: "PAYIN", status: "PENDING_APPROVAL" },
+    { $set: update }, { returnDocument: "after" });
+  if (!tx) return res.status(409).json({ message: "Pending deposit unavailable." });
+  if (cancel) return res.json({ message: "Deposit cancelled." });
+  const owner = await UserModel.findOne({ userId }).select("email");
+  const delivered = await dispatchDepositApproval(tx, owner.email);
+  return res.json({ delivered, message: delivered ? "Fresh approval email sent." : "Email delivery failed. Your deposit is still pending." });
+});
+
 app.post("/fundDeposit/initiate", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     const { amount, upiId } = req.body;
-    const validation = validatePositiveAmount(amount, { min: 1, max: 100000000 });
+    const validation = validatePositiveAmount(amount, { min: 1, max: 10000000 });
     if (!validation.valid) {
       return res.status(400).json({ success: false, message: validation.message });
     }
@@ -2569,17 +2319,7 @@ app.post("/fundDeposit/initiate", requireAuth, tradeFundsLimiter, async (req, re
     });
     await newTx.save();
 
-    const approveUrl = `${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${approvalToken}&decision=APPROVE`;
-    const declineUrl = `${PUBLIC_BACKEND_URL}/fundDeposit/action?token=${approvalToken}&decision=REJECT`;
-
-    await sendFundDepositEmail({
-      toEmail: userEmail,
-      amount: numAmount,
-      upiId: cleanUpi,
-      referenceId,
-      approveUrl,
-      declineUrl,
-    });
+    const delivered = await dispatchDepositApproval(newTx, userEmail);
 
     try {
       await createNotification({
@@ -2601,10 +2341,9 @@ app.post("/fundDeposit/initiate", requireAuth, tradeFundsLimiter, async (req, re
 
     res.status(201).json({
       success: true,
-      message: `UPI Collect Request sent to ${cleanUpi}! Please approve the payment via the authorization email sent to ${userEmail}.`,
+      delivered,
+      message: delivered ? "Check your email to approve this simulated deposit." : "Email delivery failed. Your deposit is still pending.",
       transaction: safeTx,
-      approveUrl,
-      declineUrl,
     });
   } catch (error) {
     logger.error("fund_deposit_initiate_error", { error: error.message });
@@ -2613,7 +2352,7 @@ app.post("/fundDeposit/initiate", requireAuth, tradeFundsLimiter, async (req, re
 });
 
 // 2a. Confirmation GET page (does not mutate state on GET pre-fetch / link scan)
-app.get("/fundDeposit/action", async (req, res) => {
+app.get("/fundDeposit/action", requireAuth, async (req, res) => {
   try {
     const token = typeof req.query.token === "string" ? req.query.token.trim() : "";
     const decision = typeof req.query.decision === "string" ? req.query.decision.trim().toUpperCase() : "";
@@ -2621,19 +2360,20 @@ app.get("/fundDeposit/action", async (req, res) => {
       return res.status(400).send("<h3>Invalid or missing deposit action parameters.</h3>");
     }
 
-    const tx = await FundsTransactionModel.findOne({ approvalToken: token });
+    const tx = await FundsTransactionModel.findOne({ approvalToken: token, userId: getAuthenticatedUserId(req) });
     if (!tx || (tx.approvalExpiresAt && new Date(tx.approvalExpiresAt) < new Date())) {
-      return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Request Expired</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Link Expired or Invalid</h2><p>We could not find an active deposit request for this token.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">Return to Zerodha Kite</a></body></html>`);
+      return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Request Expired</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Link Expired or Invalid</h2><p>We could not find an active deposit request for this token.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds">Return to Zerodha Kite</a></body></html>`);
     }
 
     if (tx.status !== "PENDING_APPROVAL") {
-      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Already Processed</h2><p>Deposit request <strong>${escapeHtml(tx.referenceId)}</strong> has already been marked as <strong>${escapeHtml(tx.status)}</strong>.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">View in Zerodha Kite</a></body></html>`);
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Transfer Already Processed</h2><p>Deposit request <strong>${escapeHtml(tx.referenceId)}</strong> has already been marked as <strong>${escapeHtml(tx.status)}</strong>.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds">View in Zerodha Kite</a></body></html>`);
     }
 
     return res.send(
       renderConfirmationPage({
-        title: decision === "APPROVE" ? "Confirm UPI Fund Deposit" : "Decline UPI Fund Deposit",
-        subtitle: "Please confirm your deposit authorization decision below to proceed.",
+        csrfToken: parseCookies(req.headers.cookie || "").zerodha_csrf,
+        title: decision === "APPROVE" ? "Confirm demo fund deposit" : "Decline UPI Fund Deposit",
+        subtitle: "Confirm this simulated deposit. No real payment occurs.",
         actionUrl: `${PUBLIC_BACKEND_URL}/fundDeposit/action`,
         token,
         decision,
@@ -2642,7 +2382,7 @@ app.get("/fundDeposit/action", async (req, res) => {
           ["Reference ID", tx.referenceId],
           ["Payer UPI ID", tx.upiId],
         ],
-        returnUrl: `${PUBLIC_FRONTEND_URL}/funds`,
+        returnUrl: `${PUBLIC_DASHBOARD_URL}/funds`,
       })
     );
   } catch (error) {
@@ -2652,13 +2392,15 @@ app.get("/fundDeposit/action", async (req, res) => {
 });
 
 // 2b. Atomic state-changing POST endpoint for deposit approval / rejection
-app.post("/fundDeposit/action", authLimiter, async (req, res) => {
+async function handleFundDepositAction(req, res) {
   try {
-    const token = typeof req.body.token === "string" ? req.body.token.trim() : "";
-    const decision = typeof req.body.decision === "string" ? req.body.decision.trim().toUpperCase() : "";
+    const body = req.body || {};
+    const token = typeof body.token === "string" ? body.token.trim() : "";
+    const decision = typeof body.decision === "string" ? body.decision.trim().toUpperCase() : "";
     if (!token || !["APPROVE", "REJECT"].includes(decision)) {
-      return res.status(400).send("<h3>Invalid or missing deposit action parameters.</h3>");
+      return res.status(400).send("Invalid deposit confirmation.");
     }
+    const selector = { approvalToken: token, userId: getAuthenticatedUserId(req), type: "PAYIN" };
 
     const now = new Date();
     const isApprove = decision === "APPROVE";
@@ -2667,9 +2409,9 @@ app.post("/fundDeposit/action", authLimiter, async (req, res) => {
       const sOpt = session ? { session } : undefined;
       const tx = await FundsTransactionModel.findOneAndUpdate(
         {
-          approvalToken: token,
+          ...selector,
           status: "PENDING_APPROVAL",
-          $or: [{ approvalExpiresAt: { $gt: now } }, { approvalExpiresAt: null }, { approvalExpiresAt: { $exists: false } }],
+          approvalExpiresAt: { $gt: now },
         },
         {
           $set: {
@@ -2691,8 +2433,15 @@ app.post("/fundDeposit/action", authLimiter, async (req, res) => {
         const newAvailPaise = addPaise(toPaise(funds.equity.availableMargin), amountPaise);
         const newPayinPaise = addPaise(toPaise(funds.equity.payin || "0"), amountPaise);
 
+        const depositCapPaise = 100000000 * 100;
+        if (newPayinPaise > depositCapPaise) {
+          tx.status = "REJECTED";
+          tx.remarks = "Cumulative demo deposit allowance exceeded.";
+          await tx.save(sOpt);
+          return { found: true, remainingPaise: Math.max(0, depositCapPaise - toPaise(funds.equity.payin)) };
+        }
         funds.equity.availableMargin = formatPaiseINR(newAvailPaise);
-        funds.equity.availableCash = formatPaiseINR(newAvailPaise);
+        funds.equity.availableCash = formatPaiseINR(toPaise(funds.equity.availableCash) + amountPaise);
         funds.equity.payin = formatPaiseINR(newPayinPaise);
         await funds.save(sOpt);
       }
@@ -2701,9 +2450,12 @@ app.post("/fundDeposit/action", authLimiter, async (req, res) => {
     });
 
     if (!outcome.found) {
-      return res.status(409).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Request Invalid or Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Deposit Request Invalid, Expired, or Already Processed</h2><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">View in Zerodha Kite</a></body></html>`);
+      return res.status(409).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Request Invalid or Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Deposit Request Invalid, Expired, or Already Processed</h2><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds">View in Zerodha Kite</a></body></html>`);
     }
 
+    if (outcome.remainingPaise !== undefined) {
+      return res.status(409).send("Deposit declined. Remaining demo allowance: INR " + formatPaiseINR(outcome.remainingPaise));
+    }
     const { tx } = outcome;
     try {
       await createNotification({
@@ -2720,22 +2472,24 @@ app.post("/fundDeposit/action", authLimiter, async (req, res) => {
 
     logger.info("fund_deposit_processed", { userId: tx.userId, status: tx.status, referenceId: tx.referenceId });
 
+
     if (isApprove) {
-      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Approved - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#16a34a;">Funds Credited Successfully!</h2><p>Amount: <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong></p><p>Ref: <code>${escapeHtml(tx.referenceId)}</code> &bull; UPI: ${escapeHtml(tx.upiId)}</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds" style="display:inline-block;background:#16a34a;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;">View in Zerodha Kite Dashboard</a></div></body></html>`);
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Payment Approved - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#16a34a;">Funds Credited Successfully!</h2><p>Amount: <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong></p><p>Ref: <code>${escapeHtml(tx.referenceId)}</code> &bull; UPI: ${escapeHtml(tx.upiId)}</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds" style="display:inline-block;background:#16a34a;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;">View in Zerodha Kite Dashboard</a></div></body></html>`);
     }
-    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Transfer Declined - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#dc2626;">UPI Transfer Declined</h2><p>Declined request for <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong>. No funds transferred.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/funds">Return to Dashboard</a></div></body></html>`);
+    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Transfer Declined - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#dc2626;">UPI Transfer Declined</h2><p>Declined request for <strong>₹${escapeHtml(formatIndianCurrency(tx.amount))}</strong>. No funds transferred.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/funds">Return to Dashboard</a></div></body></html>`);
   } catch (error) {
     logger.error("fund_deposit_post_action_error", { error: error.message });
     res.status(500).send("<h3>Server error processing deposit authorization.</h3>");
   }
-});
+}
+app.post("/fundDeposit/action", authLimiter, requireAuth, handleFundDepositAction);
 
 // 3. Fetch User's Funds Transaction Ledger
 app.get("/fundsTransactions", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
     if (!userId) return res.status(200).json([]);
-    const transactions = await FundsTransactionModel.find({ userId }).sort({ createdAt: -1 });
+    const transactions = await FundsTransactionModel.find({ userId }).select("-approvalToken").sort({ createdAt: -1 });
     res.status(200).json(transactions);
   } catch (error) {
     res.status(500).json({ error: "Failed to fetch funds transactions" });
@@ -2990,21 +2744,19 @@ app.post("/withdrawFunds", requireAuth, tradeFundsLimiter, async (req, res) => {
 app.post("/pledgeHolding", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
-    const { symbol, companyName, quantity, marketPrice } = req.body;
+    const { symbol: requestedSymbol, companyName, quantity } = req.body;
+    const symbol = typeof requestedSymbol === "string" && requestedSymbol.trim().toUpperCase();
     if (!symbol || typeof symbol !== "string") {
       return res.status(400).json({ success: false, message: "Valid stock symbol is required." });
     }
-    const numQty = parseInt(quantity, 10);
-    const priceValidation = validatePositiveAmount(marketPrice || 100, { min: 0.01, max: 10000000 });
-    if (!Number.isInteger(numQty) || numQty <= 0 || !priceValidation.valid) {
-      return res.status(400).json({ success: false, message: "Valid positive quantity and market price are required." });
+    const numQty = Number(quantity);
+    if (!["number", "string"].includes(typeof quantity) || !Number.isSafeInteger(numQty) || numQty <= 0) {
+      return res.status(400).json({ success: false, message: "A positive whole quantity is required." });
     }
-    const numPrice = priceValidation.amount;
-
-    const sym = symbol.trim().toUpperCase();
-    let haircutPercent = 20;
-    if (sym === "RELIANCE" || sym === "TCS") haircutPercent = 12.5;
-    else if (sym === "INFY" || sym === "HDFCBANK" || sym === "ICICIBANK") haircutPercent = 15;
+    const quote = await executionQuote(symbol);
+    if (!quote) return res.status(409).json({ success: false, code: "QUOTE_UNAVAILABLE" });
+    const numPrice = quote.price;
+    const haircutPercent = 20;
 
     const txResult = await withUserLock(`funds:${userId}`, async () =>
       runInTransaction(async (session) => {
@@ -3014,7 +2766,8 @@ app.post("/pledgeHolding", requireAuth, tradeFundsLimiter, async (req, res) => {
         const holding = await holdingQuery;
 
         const ownedQty = holding ? holding.qty : 0;
-        if (ownedQty < numQty) {
+        const reserved = await pledgedUnits(userId, symbol, session);
+        if (ownedQty - reserved < numQty) {
           return {
             status: 400,
             payload: {
@@ -3375,12 +3128,23 @@ app.post("/applyIpo", requireAuth, tradeFundsLimiter, async (req, res) => {
 app.get("/myIpoApplications", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
-    const applications = await IpoApplicationModel.find({ userId }).sort({ appliedAt: -1 });
+    const applications = await IpoApplicationModel.find({ userId }).select("-mandateToken").sort({ appliedAt: -1 });
     res.status(200).json(applications);
   } catch (error) {
     console.error("Error fetching user IPO applications:", error);
     res.status(500).json({ error: "Failed to fetch IPO applications" });
   }
+});
+
+app.post("/approveIpoApplication/:id", requireAuth, tradeFundsLimiter, async (req, res) => {
+  const userId = getAuthenticatedUserId(req);
+  if (!isValidObjectId(req.params.id)) return res.status(400).json({ message: "Invalid application." });
+  const application = await IpoApplicationModel.findOneAndUpdate({
+    _id: req.params.id, userId, status: "MANDATE_PENDING", mandateStatus: "PENDING_APPROVAL"
+  }, { $set: { status: "APPLIED", mandateStatus: "ACCEPTED", mandateDecidedAt: new Date(), mandateToken: null } },
+    { returnDocument: "after" }).select("-mandateToken");
+  if (!application) return res.status(409).json({ success: false, message: "Pending application unavailable." });
+  return res.json({ success: true, application });
 });
 
 // 3a. Confirmation GET page (prevents CSRF / GET pre-fetcher from mutating IPO mandate)
@@ -3394,11 +3158,11 @@ app.get("/ipoMandate/action", async (req, res) => {
 
     const application = await IpoApplicationModel.findOne({ mandateToken: token });
     if (!application || (application.mandateExpiresAt && new Date(application.mandateExpiresAt) < new Date())) {
-      return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Expired</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2 style="color:#ef4444;">Mandate Link Invalid or Expired</h2><p>We could not find an active IPO mandate for this authorization link.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">Return to Zerodha Kite</a></body></html>`);
+      return res.status(404).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Expired</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2 style="color:#ef4444;">Mandate Link Invalid or Expired</h2><p>We could not find an active IPO mandate for this authorization link.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/bids">Return to Zerodha Kite</a></body></html>`);
     }
 
     if (application.mandateStatus !== "PENDING_APPROVAL") {
-      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Mandate Already Processed</h2><p>Mandate for <strong>${escapeHtml(application.companyName)}</strong> has already been marked as <strong>${escapeHtml(application.mandateStatus)}</strong>.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">View in Zerodha Kite</a></body></html>`);
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>Mandate Already Processed</h2><p>Mandate for <strong>${escapeHtml(application.companyName)}</strong> has already been marked as <strong>${escapeHtml(application.mandateStatus)}</strong>.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/bids">View in Zerodha Kite</a></body></html>`);
     }
 
     return res.send(
@@ -3414,7 +3178,7 @@ app.get("/ipoMandate/action", async (req, res) => {
           ["Amount Blocked", `₹${formatIndianCurrency(application.totalAmount)}`],
           ["UPI ID", application.upiId],
         ],
-        returnUrl: `${PUBLIC_FRONTEND_URL}/bids`,
+        returnUrl: `${PUBLIC_DASHBOARD_URL}/bids`,
       })
     );
   } catch (error) {
@@ -3452,7 +3216,7 @@ app.post("/ipoMandate/action", authLimiter, async (req, res) => {
     );
 
     if (!application) {
-      return res.status(409).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Invalid or Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>IPO Mandate Invalid, Expired, or Already Processed</h2><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">View in Zerodha Kite</a></body></html>`);
+      return res.status(409).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Invalid or Already Processed</title></head><body style="font-family:sans-serif;text-align:center;padding:50px;"><h2>IPO Mandate Invalid, Expired, or Already Processed</h2><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/bids">View in Zerodha Kite</a></body></html>`);
     }
 
     try {
@@ -3469,9 +3233,9 @@ app.post("/ipoMandate/action", authLimiter, async (req, res) => {
     } catch (e) {}
 
     if (isApprove) {
-      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>UPI Mandate Approved - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#15803d;">UPI Mandate Approved!</h2><p>ASBA block registered for <strong>${escapeHtml(application.companyName)}</strong>.</p><p>App No: <code>${escapeHtml(application.applicationNumber)}</code> &bull; Amount: ₹${escapeHtml(formatIndianCurrency(application.totalAmount))}</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids" style="display:inline-block;background:#387ed1;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;">View in Zerodha Kite Dashboard</a></div></body></html>`);
+      return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>UPI Mandate Approved - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#15803d;">UPI Mandate Approved!</h2><p>ASBA block registered for <strong>${escapeHtml(application.companyName)}</strong>.</p><p>App No: <code>${escapeHtml(application.applicationNumber)}</code> &bull; Amount: ₹${escapeHtml(formatIndianCurrency(application.totalAmount))}</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/bids" style="display:inline-block;background:#387ed1;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;">View in Zerodha Kite Dashboard</a></div></body></html>`);
     }
-    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Declined - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#dc2626;">UPI Mandate Declined</h2><p>You declined the mandate for <strong>${escapeHtml(application.companyName)}</strong>.</p><a href="${escapeHtml(PUBLIC_FRONTEND_URL)}/bids">Return to Dashboard</a></div></body></html>`);
+    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mandate Declined - Zerodha Kite</title></head><body style="font-family:sans-serif;background:#f8fafc;padding:40px 20px;text-align:center;"><div style="max-width:500px;margin:0 auto;background:#fff;padding:36px 28px;border-radius:8px;border:1px solid #e2e8f0;"><h2 style="color:#dc2626;">UPI Mandate Declined</h2><p>You declined the mandate for <strong>${escapeHtml(application.companyName)}</strong>.</p><a href="${escapeHtml(PUBLIC_DASHBOARD_URL)}/bids">Return to Dashboard</a></div></body></html>`);
   } catch (error) {
     logger.error("ipo_mandate_post_action_error", { error: error.message });
     res.status(500).send("<h3>Internal server error processing mandate decision.</h3>");
@@ -3487,8 +3251,8 @@ app.delete("/cancelIpoApplication/:id", requireAuth, async (req, res) => {
     }
     const { id } = req.params;
     const appDoc = await IpoApplicationModel.findOneAndUpdate(
-      { _id: id, userId },
-      { status: "CANCELLED", mandateStatus: "REJECTED" },
+      { _id: id, userId, status: { $in: ["MANDATE_PENDING", "APPLIED"] } },
+      { status: "CANCELLED", mandateStatus: "REJECTED", mandateToken: null },
       { new: true }
     );
     if (!appDoc) {
@@ -3527,7 +3291,7 @@ app.put("/modifyIpoBid/:id", requireAuth, async (req, res) => {
       return res.status(404).json({ success: false, message: "IPO application not found." });
     }
 
-    if (appDoc.status === "CANCELLED") {
+    if (!["MANDATE_PENDING", "APPLIED"].includes(appDoc.status)) {
       return res.status(400).json({ success: false, message: "Cancelled applications cannot be modified. Please submit a new bid." });
     }
 
@@ -3553,8 +3317,11 @@ app.put("/modifyIpoBid/:id", requireAuth, async (req, res) => {
     if (upiId && upiId.trim()) {
       appDoc.upiId = upiId.trim();
     }
-    appDoc.status = "APPLIED";
-    appDoc.mandateStatus = "ACCEPTED";
+    appDoc.status = "MANDATE_PENDING";
+    appDoc.mandateStatus = "PENDING_APPROVAL";
+    appDoc.mandateDecidedAt = undefined;
+    appDoc.mandateToken = crypto.randomBytes(24).toString("hex");
+    appDoc.mandateExpiresAt = new Date(Date.now() + 48 * 3600000);
     await appDoc.save();
 
     try {
@@ -3571,7 +3338,7 @@ app.put("/modifyIpoBid/:id", requireAuth, async (req, res) => {
     res.status(200).json({
       success: true,
       message: `IPO application for ${appDoc.companyName} modified successfully!`,
-      application: appDoc,
+      application: { ...appDoc.toObject(), mandateToken: undefined },
     });
   } catch (error) {
     console.error("Error modifying IPO bid:", error);
@@ -4163,66 +3930,8 @@ app.get("/mySseApplications", requireAuth, async (req, res) => {
 // ============================================================================
 
 // Helper: Calculate Next Trigger Date based on frequency, day, and time
-function calculateNextTriggerDate(frequency, scheduleDay, scheduleTime) {
-  const [hours, minutes] = (scheduleTime || "09:30").split(":").map(Number);
-  const now = new Date();
-  let next = new Date();
-  next.setHours(hours, minutes, 0, 0);
-
-  if (frequency === "WEEKLY") {
-    const targetDay = Math.min(Math.max(1, scheduleDay || 1), 5); // 1=Mon...5=Fri
-    const currentDay = now.getDay();
-    let daysUntil = targetDay - currentDay;
-    if (daysUntil < 0 || (daysUntil === 0 && now >= next)) {
-      daysUntil += 7;
-    }
-    next.setDate(now.getDate() + daysUntil);
-  } else if (frequency === "DAILY") {
-    if (now >= next) {
-      next.setDate(now.getDate() + 1);
-    }
-    if (next.getDay() === 6) next.setDate(next.getDate() + 2);
-    if (next.getDay() === 0) next.setDate(next.getDate() + 1);
-  } else {
-    // MONTHLY
-    const targetDay = Math.min(Math.max(1, scheduleDay || 5), 28);
-    next.setDate(targetDay);
-    if (now >= next) {
-      next.setMonth(next.getMonth() + 1);
-      next.setDate(targetDay);
-    }
-  }
-  return next;
-}
-
-// Helper: Advance to the Next Execution Cycle (used when an installment is executed)
-function advanceNextTriggerDate(frequency, scheduleDay, scheduleTime, currentTrigger) {
-  const [hours, minutes] = (scheduleTime || "09:30").split(":").map(Number);
-  const now = new Date();
-  let base = currentTrigger ? new Date(currentTrigger) : new Date();
-
-  // If the previous trigger was in the past or today, ensure forward advancement
-  if (base <= now) {
-    base = new Date(now);
-  }
-
-  let next = new Date(base);
-  next.setHours(hours, minutes, 0, 0);
-
-  if (frequency === "WEEKLY") {
-    next.setDate(next.getDate() + 7);
-  } else if (frequency === "DAILY") {
-    next.setDate(next.getDate() + 1);
-    if (next.getDay() === 6) next.setDate(next.getDate() + 2); // Saturday -> Monday
-    if (next.getDay() === 0) next.setDate(next.getDate() + 1); // Sunday -> Monday
-  } else {
-    // MONTHLY
-    const targetDay = Math.min(Math.max(1, scheduleDay || 5), 28);
-    next.setMonth(next.getMonth() + 1);
-    next.setDate(targetDay);
-  }
-  return next;
-}
+const { nextSipDate: calculateNextTriggerDate } = require("./utils/sipSchedule");
+const { processInstallment } = require("./utils/sipExecution");
 
 // 0. Catalog of 50 Real Market SIPs (Stored in & Fetched directly from MongoDB Atlas!)
 app.get("/marketSipsCatalog", catalogLimiter, async (req, res) => {
@@ -4268,9 +3977,14 @@ app.post("/createSip", requireAuth, async (req, res) => {
       instruments: customInstruments,
       frequency = "MONTHLY",
       scheduleDay = 5,
-      scheduleTime = "09:30",
+
     } = req.body;
 
+    const scheduleTime = "10:00";
+    if (!["DAILY","WEEKLY","MONTHLY"].includes(frequency) || !Number.isInteger(Number(scheduleDay)) ||
+        Number(scheduleDay) < 1 || Number(scheduleDay) > (frequency === "WEEKLY" ? 7 : 31)) {
+      return res.status(400).json({ message: "Invalid SIP frequency or schedule day." });
+    }
     let finalName = name;
     let finalInstruments = [];
     let finalBasketId = basketId || null;
@@ -4333,7 +4047,7 @@ app.post("/createSip", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: "SIP name is required." });
     }
 
-    const nextTriggerAt = calculateNextTriggerDate(frequency, Number(scheduleDay), scheduleTime);
+    const nextTriggerAt = calculateNextTriggerDate(frequency, Number(scheduleDay));
 
     const newSip = new SipModel({
       userId,
@@ -4391,7 +4105,7 @@ app.patch("/toggleSipStatus/:id", requireAuth, async (req, res) => {
 
     sip.status = sip.status === "ACTIVE" ? "PAUSED" : "ACTIVE";
     if (sip.status === "ACTIVE") {
-      sip.nextTriggerAt = calculateNextTriggerDate(sip.frequency, sip.scheduleDay, sip.scheduleTime);
+      sip.nextTriggerAt = calculateNextTriggerDate(sip.frequency, sip.scheduleDay);
     }
     await sip.save();
 
@@ -4449,148 +4163,6 @@ app.patch("/updateSipName/:id", requireAuth, async (req, res) => {
 });
 
 // 4. Internal Executor function (Supports direct instruments or linked baskets!)
-async function executeSipInternal(sipId) {
-  const sip = await SipModel.findById(sipId);
-  if (!sip) throw new Error("SIP not found");
-
-  // Resolve order legs: direct instruments preferred, fallback to basket
-  let orderLegs = Array.isArray(sip.instruments) && sip.instruments.length > 0 ? sip.instruments : [];
-  if (orderLegs.length === 0 && sip.basketId) {
-    const basket = await BasketModel.findById(sip.basketId);
-    if (basket && Array.isArray(basket.items)) {
-      orderLegs = basket.items;
-    }
-  }
-
-  if (orderLegs.length === 0) {
-    throw new Error(`SIP "${sip.name}" has no investment instruments configured`);
-  }
-
-  const userId = sip.userId;
-
-  // Check user email
-  let userEmail = process.env.EMAIL_USER;
-  const userDoc = await UserModel.findOne({ userId });
-  if (userDoc?.email) userEmail = userDoc.email;
-
-  // Calculate required margin
-  let totalMarginRequired = 0;
-  for (const item of orderLegs) {
-    const cost = (Number(item.qty) || 1) * (Number(item.price) || 100);
-    totalMarginRequired += item.product === "MIS" ? cost * 0.2 : cost;
-  }
-
-  let funds = await getOrCreateUserFunds(userId);
-  const availableMargin = parseFloat(funds?.equity?.availableMargin?.replace(/,/g, "") || "0");
-
-  const nextCycleDate = advanceNextTriggerDate(sip.frequency, sip.scheduleDay, sip.scheduleTime, sip.nextTriggerAt);
-  const formattedNextDate = nextCycleDate.toLocaleDateString("en-IN", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-  });
-
-  // 1. INSUFFICIENT MARGIN CASE (Option A + Email Alert)
-  if (availableMargin < totalMarginRequired) {
-    sip.executionLogs.push({
-      executedAt: new Date(),
-      ordersCount: 0,
-      amountDebited: 0,
-      status: "FAILED_INSUFFICIENT_FUNDS",
-      failureReason: `Required: ₹${totalMarginRequired.toLocaleString("en-IN")}, Available: ₹${availableMargin.toLocaleString("en-IN")}`,
-    });
-    sip.nextTriggerAt = nextCycleDate;
-    await sip.save();
-
-    try {
-      await createNotification({
-        userId,
-        type: "FUNDS",
-        category: "MARGIN",
-        title: `SIP Skipped - ${sip.name}`,
-        description: `Installment skipped due to insufficient margin. Required: ₹${formatIndianCurrency(totalMarginRequired)}, Available: ₹${formatIndianCurrency(availableMargin)}.`,
-        metadata: { actionUrl: "/funds" },
-      });
-    } catch (e) {}
-
-    await sendSipFailureEmail({
-      toEmail: userEmail,
-      sipName: sip.name,
-      basketName: sip.basketName || sip.symbol || sip.name,
-      requiredAmount: totalMarginRequired,
-      availableAmount: availableMargin,
-      nextDate: formattedNextDate,
-    });
-
-    return {
-      success: false,
-      code: "INSUFFICIENT_MARGIN",
-      message: `Insufficient margin! Required: ₹${formatIndianCurrency(totalMarginRequired)}, Available: ₹${formatIndianCurrency(availableMargin)}. Failure alert sent to ${userEmail}.`,
-      sip,
-    };
-  }
-
-  // 2. SUFFICIENT MARGIN: Execute order legs concurrently
-  const executedOrders = [];
-  let totalDebited = 0;
-
-  for (const item of orderLegs) {
-    const result = await executeOrderInternal({
-      name: item.symbol || item.name,
-      qty: item.qty || 1,
-      price: item.price,
-      mode: item.mode || "BUY",
-      product: item.product || "CNC",
-      userId,
-    });
-
-    if (!result.success) {
-      throw new Error(`Failed to execute leg ${item.symbol}: ${result.message}`);
-    }
-    executedOrders.push(result.order);
-    totalDebited += (Number(item.qty) || 1) * (Number(item.price) || 100);
-  }
-
-  sip.totalInstallmentsExecuted += 1;
-  sip.totalCapitalInvested += totalDebited;
-  sip.lastExecutedAt = new Date();
-  sip.nextTriggerAt = nextCycleDate;
-  sip.executionLogs.push({
-    executedAt: new Date(),
-    ordersCount: executedOrders.length,
-    amountDebited: totalDebited,
-    status: "SUCCESS",
-  });
-  await sip.save();
-
-  try {
-    await createNotification({
-      userId,
-      type: "ORDER",
-      category: "EXECUTION",
-      title: `Stock SIP Executed - ${sip.name}`,
-      description: `SIP installment executed with ${executedOrders.length} orders totaling ₹${formatIndianCurrency(totalDebited)}.`,
-      metadata: { actionUrl: "/orders" },
-    });
-  } catch (e) {}
-
-  await sendSipSuccessEmail({
-    toEmail: userEmail,
-    sipName: sip.name,
-    basketName: sip.basketName || sip.symbol || sip.name,
-    executedOrdersCount: executedOrders.length,
-    totalAmount: totalDebited,
-    nextDate: formattedNextDate,
-  });
-
-  return {
-    success: true,
-    message: `Stock SIP "${sip.name}" executed successfully! ${executedOrders.length} orders placed.`,
-    sip,
-    executedOrders,
-  };
-}
-
 // 5. Route to trigger SIP immediately (Option 1 - Interactive Pro Mode)
 app.post("/executeSipNow/:id", requireAuth, tradeFundsLimiter, async (req, res) => {
   try {
@@ -4603,7 +4175,11 @@ app.post("/executeSipNow/:id", requireAuth, tradeFundsLimiter, async (req, res) 
     if (!ownedSip) {
       return res.status(404).json({ success: false, message: "SIP not found" });
     }
-    const result = await executeSipInternal(id);
+    const requested = new Date(req.body?.scheduledAt);
+    if (!Number.isFinite(+requested) || +requested !== +ownedSip.nextTriggerAt) {
+      return res.status(409).json({ success: false, message: "Refresh the installment before confirming." });
+    }
+    const result = await processInstallment(id, requested, executeOrderInternal);
     if (!result.success) {
       const status = result.code === "CDSL_AUTH_REQUIRED" ? 403 : 400;
       return res.status(status).json(result);
@@ -4653,13 +4229,13 @@ async function runSipWorkerCycle() {
     const now = new Date();
     const dueSips = await SipModel.find({
       status: "ACTIVE",
-      nextTriggerAt: { $lte: now },
+      $or: [{ nextTriggerAt: { $lte: now } }, { installment: { $exists: true } }],
     });
 
     for (const sip of dueSips) {
       logger.info("sip_cron_triggered", { sipId: String(sip._id), name: sip.name });
       try {
-        await executeSipInternal(sip._id);
+        await processInstallment(sip._id, sip.nextTriggerAt, executeOrderInternal);
       } catch (err) {
         logger.error("sip_cron_execution_error", { sipId: String(sip._id), error: err.message });
       }
@@ -5312,7 +4888,6 @@ app.post("/cdsl/generate-tpin", requireAuth, otpLimiter, async (req, res) => {
     user.cdslLockedUntil = null;
     await user.save();
 
-    console.log(`🔐 [CDSL TPIN DISPATCHED] Email: ${toEmail} | TPIN: ${generatedTpin}`);
     const emailResult = await sendCdslTpinEmail(toEmail, generatedTpin, user.demat);
     logger.info("cdsl_tpin_dispatched", { userId, delivered: emailResult.delivered });
 
@@ -5398,7 +4973,6 @@ app.post("/cdsl/verify-tpin", requireAuth, authLimiter, async (req, res) => {
       { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
     );
 
-    console.log(`🔑 [CDSL TRANSACTION OTP DISPATCHED] Email: ${toEmail} | OTP: ${generatedOtp}`);
     const emailResult = await sendCdslTransactionOtpEmail(toEmail, generatedOtp, stockName, stockQty);
     logger.info("cdsl_otp_dispatched", { userId, delivered: emailResult.delivered });
 
@@ -5630,7 +5204,20 @@ app.use((err, req, res, next) => {
 
 let serverInstance = null;
 
+const { advanceQuoteClock, PERIOD } = require("./utils/quoteClock");
+let quoteTimer;
+let quoteBusy = false;
 function startBackgroundWorkers() {
+  if (!quoteTimer) {
+    quoteTimer = setInterval(async () => {
+      if (quoteBusy) return;
+      quoteBusy = true;
+      try { await databaseReady; await advanceQuoteClock(new Date(), async session => { await reservations.evaluatePending(executeOrderInternal, session); await gttExecution.evaluateActive(executeOrderInternal, session); }); }
+      catch (error) { logger.error("quote_update_failed", { message: error.message }); }
+      finally { quoteBusy = false; }
+    }, PERIOD);
+    quoteTimer.unref();
+  }
   if (!sipWorkerInterval) {
     sipWorkerInterval = setInterval(runSipWorkerCycle, 45000);
     if (sipWorkerInterval.unref) sipWorkerInterval.unref();
@@ -5642,6 +5229,8 @@ function startBackgroundWorkers() {
 }
 
 function stopBackgroundWorkers() {
+  clearInterval(quoteTimer);
+  quoteTimer = null;
   if (sipWorkerInterval) {
     clearInterval(sipWorkerInterval);
     sipWorkerInterval = null;
@@ -5653,7 +5242,7 @@ function stopBackgroundWorkers() {
 }
 
 function startServer(port = PORT) {
-  startBackgroundWorkers();
+  if (!IS_TEST) startBackgroundWorkers();
   serverInstance = app.listen(port, () => {
     logger.info("server_started", { port, env: NODE_ENV });
   });
@@ -5679,4 +5268,4 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { app, startServer, shutdown };
+module.exports = { executeOrderInternal, app, startServer, shutdown, databaseReady, stopBackgroundWorkers };

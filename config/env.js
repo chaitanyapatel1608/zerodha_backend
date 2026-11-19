@@ -1,5 +1,8 @@
 const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
+// Test suites must supply their own configuration, never inherit a developer DB.
+if (process.env.NODE_ENV !== "test") {
+  require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
+}
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const IS_PROD = NODE_ENV === "production";
@@ -33,6 +36,10 @@ const MONGO_URL = process.env.MONGO_URL;
 const isRender = Boolean(process.env.RENDER || process.env.RENDER_EXTERNAL_URL);
 const PUBLIC_FRONTEND_URL =
   process.env.PUBLIC_FRONTEND_URL ||
+  (isRender ? "https://zerodha-frontend-58j9.onrender.com" : "http://localhost:3000");
+const PUBLIC_DASHBOARD_URL =
+  process.env.PUBLIC_DASHBOARD_URL ||
+  process.env.DASHBOARD_URL ||
   (isRender ? "https://zerodha-dashboard-6zf2.onrender.com" : "http://localhost:3001");
 const PUBLIC_BACKEND_URL =
   process.env.PUBLIC_BACKEND_URL ||
@@ -51,6 +58,8 @@ const ALLOWED_ORIGINS = [
   ...rawAllowedOrigins,
   process.env.FRONTEND_URL,
   process.env.PUBLIC_FRONTEND_URL,
+  process.env.DASHBOARD_URL,
+  process.env.PUBLIC_DASHBOARD_URL,
   process.env.ADMIN_URL,
   process.env.PUBLIC_ADMIN_URL,
   process.env.BACKEND_URL,
@@ -71,6 +80,7 @@ module.exports = {
   MONGO_URL,
   JWT_SECRET,
   PUBLIC_FRONTEND_URL,
+  PUBLIC_DASHBOARD_URL,
   PUBLIC_BACKEND_URL,
   ALLOWED_ORIGINS,
 };

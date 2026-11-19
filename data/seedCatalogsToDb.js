@@ -15,7 +15,7 @@ async function seedCatalogsToDb() {
         await InstrumentModel.findOneAndUpdate(
           { symbol: item.symbol },
           { $set: item },
-          { upsert: true, new: true }
+          { upsert: true, returnDocument: "after" }
         );
       }
       const updatedCount = await InstrumentModel.countDocuments();
@@ -32,7 +32,7 @@ async function seedCatalogsToDb() {
         await MarketSipCatalogModel.findOneAndUpdate(
           { code: sip.code },
           { $set: sip },
-          { upsert: true, new: true }
+          { upsert: true, returnDocument: "after" }
         );
       }
       const updatedSipCount = await MarketSipCatalogModel.countDocuments();

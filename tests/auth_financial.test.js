@@ -1,5 +1,5 @@
+require("./helpers/integrationSetup");
 const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const jwt = require("jsonwebtoken");
@@ -20,6 +20,7 @@ let isolatedServer = null;
 const JWT_SECRET = process.env.JWT_SECRET || "zerodha_jwt_super_secret_key_2026_finance_kite";
 
 test.before(async () => {
+  await require("../index").databaseReady;
   if (!API_BASE) {
     process.env.NODE_ENV = "test";
     const { app } = require("../index");
@@ -283,7 +284,7 @@ test("FIN-Deposit-Confirmation: GET does not mutate state; POST approves once & 
     // GET confirmation renders HTML form without mutating balance or status
     const getAction = await apiRequest(
       `/fundDeposit/action?token=${txDoc.approvalToken}&decision=APPROVE`,
-      { method: "GET" }
+      { method: "GET", token: mintToken(uid) }
     );
     assert.equal(getAction.status, 200);
     assert.ok(getAction.text.includes('method="POST"'));
@@ -294,7 +295,7 @@ test("FIN-Deposit-Confirmation: GET does not mutate state; POST approves once & 
     // POST executes credit atomically
     const form = new URLSearchParams({ token: txDoc.approvalToken, decision: "APPROVE" });
     const postAction = await apiRequest("/fundDeposit/action", {
-      method: "POST",
+      method: "POST", token: mintToken(uid),
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       rawBody: form.toString(),
     });
@@ -306,7 +307,7 @@ test("FIN-Deposit-Confirmation: GET does not mutate state; POST approves once & 
 
     // Second POST replay must fail cleanly with 409
     const replayAction = await apiRequest("/fundDeposit/action", {
-      method: "POST",
+      method: "POST", token: mintToken(uid),
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       rawBody: form.toString(),
     });
@@ -317,6 +318,58 @@ test("FIN-Deposit-Confirmation: GET does not mutate state; POST approves once & 
     await db.collection("funds_transactions").deleteMany({ userId: uid });
     await db.collection("notifications").deleteMany({ userId: uid });
     // kept connected for isolatedServer; disconnected in test.after
+  }
+});
+
+test("Demo deposit approval is owner-only, hides approval secrets, and credits exactly once under replay", async () => {
+  const owner = `demo_owner_${Date.now()}`;
+  const attacker = `demo_attacker_${Date.now()}`;
+  const db = mongoose.connection.db;
+  await db.collection("users").insertMany([
+    { userId: owner, email: `${owner}@example.com`, tokenVersion: 0 },
+    { userId: attacker, email: `${attacker}@example.com`, tokenVersion: 0 },
+  ]);
+  await db.collection("funds").insertOne({ userId: owner, equity: { availableMargin: "0.00", availableCash: "0.00", usedMargin: "0.00", payin: "0.00" } });
+  try {
+    const initiated = await apiRequest("/fundDeposit/initiate", { method: "POST", token: mintToken(owner), body: { amount: 125, upiId: "demo@upi" } });
+    assert.equal(initiated.status, 201);
+    assert.equal(initiated.data.demoApprovalAvailable, undefined);
+    assert.equal(initiated.data.approveUrl, undefined);
+    assert.equal(initiated.data.declineUrl, undefined);
+    const transactionId = initiated.data.transaction._id;
+    const ledger = await apiRequest("/fundsTransactions", { token: mintToken(owner) });
+    assert.ok(ledger.data.every(entry => entry.approvalToken === undefined));
+    assert.equal((await apiRequest("/fundDeposit/demo-approve", { method: "POST", token: mintToken(owner), body: { transactionId } })).status, 404);
+    const pending = await db.collection("funds_transactions").findOne({ userId: owner });
+    const resendPath = "/fundDeposit/" + transactionId + "/resend";
+    assert.equal((await apiRequest(resendPath, { method: "POST", token: mintToken(attacker) })).status, 409);
+    assert.equal((await apiRequest(resendPath, { method: "POST", token: mintToken(owner) })).status, 200);
+    const fresh = await db.collection("funds_transactions").findOne({ _id: pending._id });
+    assert.notEqual(fresh.approvalToken, pending.approvalToken);
+    assert.equal((await apiRequest("/fundDeposit/action", { method: "POST", token: mintToken(owner),
+      body: { token: pending.approvalToken, decision: "APPROVE" } })).status, 409);
+    const body = { token: fresh.approvalToken, decision: "APPROVE" };
+    assert.equal((await apiRequest("/fundDeposit/action", { method: "POST", body })).status, 401);
+    assert.equal((await apiRequest("/fundDeposit/action", { method: "POST", token: mintToken(attacker), body })).status, 409);
+    const results = await Promise.all([1, 2].map(() => apiRequest("/fundDeposit/action", { method: "POST", token: mintToken(owner), body })));
+    assert.deepEqual(results.map(result => result.status).sort(), [200, 409]);
+    const funds = await db.collection("funds").findOne({ userId: owner });
+    assert.equal(funds.equity.availableCash, "125.00");
+    const tx = await db.collection("funds_transactions").findOne({ userId: owner });
+    assert.equal(tx.status, "COMPLETED");
+    assert.equal(tx.approvalToken, null);
+    await db.collection("funds").updateOne({ userId: owner }, { $set: { "equity.payin": "99999999.00" } });
+    await apiRequest("/fundDeposit/initiate", { method: "POST", token: mintToken(owner), body: { amount: 2, upiId: "demo@upi" } });
+    const overCap = await db.collection("funds_transactions").findOne({ userId: owner, status: "PENDING_APPROVAL" });
+    const declined = await apiRequest("/fundDeposit/action", { method: "POST", token: mintToken(owner), body: { token: overCap.approvalToken, decision: "APPROVE" } });
+    assert.equal(declined.status, 409);
+    assert.equal((await db.collection("funds_transactions").findOne({ _id: overCap._id })).status, "REJECTED");
+    assert.equal((await db.collection("funds").findOne({ userId: owner })).equity.availableCash, "125.00");
+
+  } finally {
+    for (const collection of ["users", "funds", "funds_transactions", "notifications"]) {
+      await db.collection(collection).deleteMany({ userId: { $in: [owner, attacker] } });
+    }
   }
 });
 

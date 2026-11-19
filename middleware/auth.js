@@ -36,7 +36,7 @@ async function requireAuth(req, res, next) {
   if (ctx.authSource === "cookie" && STATE_CHANGING_METHODS.has(String(req.method || "").toUpperCase())) {
     const cookies = parseCookies(req.headers?.cookie || "");
     const csrfCookie = cookies.zerodha_csrf || "";
-    const csrfHeader = String(req.headers["x-csrf-token"] || "");
+    const csrfHeader = String(req.headers["x-csrf-token"] || (req.path === "/fundDeposit/action" && req.body?.csrfToken) || "");
     if (!csrfCookie || !csrfHeader || !constantTimeEquals(csrfCookie, csrfHeader)) {
       return res.status(403).json({
         success: false,

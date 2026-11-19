@@ -1,5 +1,5 @@
+require("./helpers/integrationSetup");
 const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const jwt = require("jsonwebtoken");
@@ -30,6 +30,7 @@ function mintToken(userId, tokenVersion = 0) {
 }
 
 test.before(async () => {
+  await require("../index").databaseReady;
   process.env.NODE_ENV = "test";
   const { app } = require("../index");
   await mongoose.connect(process.env.MONGO_URL);

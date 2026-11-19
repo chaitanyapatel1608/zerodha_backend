@@ -1,3 +1,4 @@
+const { closePositions } = require("../utils/closePositions");
 const express = require("express");
 const crypto = require("crypto");
 const mongoose = require("mongoose");
@@ -815,57 +816,18 @@ router.post("/positions/:id/square-off", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid position id" });
     }
 
-    const position = await PositionsModel.findById(id);
-    if (!position) {
-      return res.status(404).json({ success: false, message: "Position not found" });
-    }
-    if (position.status === "CLOSED") {
-      return res.status(400).json({ success: false, message: "Position is already closed" });
-    }
-
-    const closedQty = Math.abs(Number(position.qty || 0));
-    const exitPrice = Number(position.ltp || position.price || position.avg || 0);
-    const reason = String(req.body.reason || "RMS administrative square-off").trim();
-
-    position.status = "CLOSED";
-    position.closedAt = new Date();
-    position.updatedAt = new Date();
-    position.qty = 0;
-    await position.save();
-
-    if (closedQty > 0) {
-      await OrdersModel.create({
-        userId: position.userId,
-        name: position.name || position.instrument || "UNKNOWN",
-        qty: closedQty,
-        price: exitPrice,
-        mode: "SELL",
-        product: position.product || "MIS",
-        status: "COMPLETE",
-      });
-    }
-
-    await NotificationModel.create({
-      userId: position.userId,
-      type: "COMPLIANCE",
-      category: "RMS_SQUARE_OFF",
-      title: `RMS Square-Off: ${position.name || position.instrument}`,
-      description: `Admin RMS squared off ${closedQty} qty (${position.product || "MIS"}). Reason: ${reason}`,
-      metadata: { symbol: position.name || "", qty: closedQty, price: exitPrice, actionUrl: "/positions" },
-      priority: "CRITICAL",
+    const reason = String(req.body?.reason || "RMS administrative square-off").slice(0, 500);
+    const result = await closePositions({ _id: id }, { admin: true,
+      audit: async (position, closedQty, exitPrice, session) => {
+        await new AdminAuditLogModel({ adminUserId: req.adminUser?.userId || req.authUserId,
+          adminEmail: req.adminUser?.email, action: "RMS_POSITION_SQUAREOFF", targetType: "position",
+          targetId: id, reason, details: { userId: position.userId, symbol: position.name, closedQty, exitPrice },
+          ipAddress: req.ip, userAgent: String(req.headers["user-agent"] || "").slice(0, 240) }).save({ session });
+      }
     });
-
-    await recordAudit(req, {
-      action: "RMS_POSITION_SQUAREOFF",
-      targetType: "position",
-      targetId: String(position._id),
-      reason,
-      details: { userId: position.userId, symbol: position.name, closedQty, exitPrice },
-    });
-
-    return res.json({ success: true, position });
+    return res.json({ success: true, ...result });
   } catch (err) {
-    return res.status(500).json({ success: false, message: "Failed to square off position" });
+    return res.status(err.closeStatus || 500).json({ success: false, message: err.closeStatus ? err.message : "Failed to square off position" });
   }
 });
 

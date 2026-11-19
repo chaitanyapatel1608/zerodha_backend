@@ -1,5 +1,5 @@
+require("./helpers/integrationSetup");
 const path = require("path");
-require("dotenv").config({ path: path.resolve(__dirname, "..", ".env") });
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const jwt = require("jsonwebtoken");
@@ -17,6 +17,7 @@ let isolatedServer = null;
 const JWT_SECRET = process.env.JWT_SECRET || "zerodha_jwt_super_secret_key_2026_finance_kite";
 
 test.before(async () => {
+  await require("../index").databaseReady;
   if (!API_BASE) {
     process.env.NODE_ENV = "test";
     const { app } = require("../index");
