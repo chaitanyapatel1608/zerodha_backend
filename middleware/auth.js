@@ -42,14 +42,20 @@ async function requireAuth(req, res, next) {
 
   // Enforce CSRF double-submit check on state-changing requests authenticated via browser cookie
   if (ctx.authSource === "cookie" && STATE_CHANGING_METHODS.has(String(req.method || "").toUpperCase())) {
-    const cookies = parseCookies(req.headers?.cookie || "");
-    const csrfCookie = cookies.zerodha_csrf || "";
-    const csrfHeader = String(req.headers["x-csrf-token"] || (req.path === "/fundDeposit/action" && req.body?.csrfToken) || "");
-    if (!csrfCookie || !csrfHeader || !constantTimeEquals(csrfCookie, csrfHeader)) {
-      return res.status(403).json({
-        success: false,
-        message: "CSRF validation failed. Please refresh and try again.",
-      });
+    const hasValidBodyAuth = req.body?.authToken && typeof req.body.authToken === "string";
+    if (!hasValidBodyAuth) {
+      const cookies = parseCookies(req.headers?.cookie || "");
+      const csrfCookie = cookies.zerodha_csrf || "";
+      const csrfHeader = String(req.headers["x-csrf-token"] || (req.path === "/fundDeposit/action" && req.body?.csrfToken) || (req.path === "/ipoMandate/action" && req.body?.csrfToken) || "");
+      if (!csrfCookie || !csrfHeader || !constantTimeEquals(csrfCookie, csrfHeader)) {
+        if (req.path === "/fundDeposit/action" || req.path === "/ipoMandate/action") {
+          return res.status(403).send(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>Validation Error</title><style>body{font-family:sans-serif;text-align:center;padding:50px;}.btn{display:inline-block;background:#387ed1;color:#fff;padding:12px 24px;border-radius:4px;text-decoration:none;margin-top:16px;}</style></head><body><h2>Session Validation Expired</h2><p>Please refresh the authorization page and try again.</p><a href="javascript:location.reload()" class="btn">Refresh Page</a></body></html>`);
+        }
+        return res.status(403).json({
+          success: false,
+          message: "CSRF validation failed. Please refresh and try again.",
+        });
+      }
     }
   }
 

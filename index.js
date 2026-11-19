@@ -2408,11 +2408,15 @@ app.get("/fundDeposit/action", async (req, res) => {
 
     // If user arrived with auth_token in query, issue session cookies on backend domain as well
     const handoffToken = typeof req.query.auth_token === "string" ? req.query.auth_token.trim() : "";
+    let activeCsrfToken = "";
     if (handoffToken && typeof issueAuthSession === "function") {
       try {
         const ownerUser = await UserModel.findOne({ userId: tx.userId }).lean();
         if (ownerUser) {
-          issueAuthSession(res, req, ownerUser);
+          const sessionData = issueAuthSession(res, req, ownerUser);
+          if (sessionData?.csrfToken) {
+            activeCsrfToken = sessionData.csrfToken;
+          }
         }
       } catch (cookieErr) {
         logger.warn("fund_deposit_cookie_set_failed", { error: cookieErr.message });
@@ -2420,10 +2424,24 @@ app.get("/fundDeposit/action", async (req, res) => {
     }
 
     const cookies = parseCookies(req.headers.cookie || "");
+    if (!activeCsrfToken) {
+      activeCsrfToken = cookies.zerodha_csrf || "";
+    }
+    if (!activeCsrfToken) {
+      activeCsrfToken = crypto.randomBytes(32).toString("hex");
+      res.cookie("zerodha_csrf", activeCsrfToken, buildCookieOptions(req, false));
+    }
+
+    const effectiveAuthToken = handoffToken || (authContext ? jwt.sign(
+      { userId: authContext.userId, tv: authContext.tokenVersion },
+      JWT_SECRET,
+      { expiresIn: "1h" }
+    ) : "");
+
     return res.send(
       renderConfirmationPage({
-        csrfToken: cookies.zerodha_csrf || "",
-        authToken: handoffToken,
+        csrfToken: activeCsrfToken,
+        authToken: effectiveAuthToken,
         title: decision === "APPROVE" ? "Confirm demo fund deposit" : "Decline UPI Fund Deposit",
         subtitle: "Confirm this simulated deposit. No real payment occurs.",
         actionUrl: `${PUBLIC_BACKEND_URL}/fundDeposit/action`,
@@ -3311,11 +3329,15 @@ app.get("/ipoMandate/action", async (req, res) => {
     }
 
     const handoffToken = typeof req.query.auth_token === "string" ? req.query.auth_token.trim() : "";
+    let activeCsrfToken = "";
     if (handoffToken && typeof issueAuthSession === "function") {
       try {
         const ownerUser = await UserModel.findOne({ userId: application.userId }).lean();
         if (ownerUser) {
-          issueAuthSession(res, req, ownerUser);
+          const sessionData = issueAuthSession(res, req, ownerUser);
+          if (sessionData?.csrfToken) {
+            activeCsrfToken = sessionData.csrfToken;
+          }
         }
       } catch (cookieErr) {
         logger.warn("ipo_mandate_cookie_set_failed", { error: cookieErr.message });
@@ -3323,10 +3345,24 @@ app.get("/ipoMandate/action", async (req, res) => {
     }
 
     const cookies = parseCookies(req.headers.cookie || "");
+    if (!activeCsrfToken) {
+      activeCsrfToken = cookies.zerodha_csrf || "";
+    }
+    if (!activeCsrfToken) {
+      activeCsrfToken = crypto.randomBytes(32).toString("hex");
+      res.cookie("zerodha_csrf", activeCsrfToken, buildCookieOptions(req, false));
+    }
+
+    const effectiveAuthToken = handoffToken || (authContext ? jwt.sign(
+      { userId: authContext.userId, tv: authContext.tokenVersion },
+      JWT_SECRET,
+      { expiresIn: "1h" }
+    ) : "");
+
     return res.send(
       renderConfirmationPage({
-        csrfToken: cookies.zerodha_csrf || "",
-        authToken: handoffToken,
+        csrfToken: activeCsrfToken,
+        authToken: effectiveAuthToken,
         title: decision === "APPROVE" ? "Confirm IPO UPI Mandate" : "Decline IPO UPI Mandate",
         subtitle: `Authorize or decline the ASBA block for ${application.companyName}.`,
         actionUrl: `${PUBLIC_BACKEND_URL}/ipoMandate/action`,

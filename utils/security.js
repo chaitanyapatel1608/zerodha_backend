@@ -90,6 +90,9 @@ function resolveAuthContext(req, jwtSecret) {
   if (authHeader && authHeader.startsWith("Bearer ")) {
     token = authHeader.slice(7).trim();
     authSource = "bearer";
+  } else if (req?.body?.authToken && typeof req.body.authToken === "string") {
+    token = req.body.authToken.trim();
+    authSource = "bearer";
   } else if (req?.headers?.cookie) {
     const cookies = parseCookies(req.headers.cookie);
     if (cookies.zerodha_session) {
@@ -98,13 +101,9 @@ function resolveAuthContext(req, jwtSecret) {
     }
   }
 
-  // Support authenticated handoff token passed via secure redirect query or POST body
+  // Support authenticated handoff token passed via secure redirect query
   if (!token && req?.query?.auth_token && typeof req.query.auth_token === "string") {
     token = req.query.auth_token.trim();
-    authSource = "bearer";
-  }
-  if (!token && req?.body?.authToken && typeof req.body.authToken === "string") {
-    token = req.body.authToken.trim();
     authSource = "bearer";
   }
 
