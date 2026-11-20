@@ -17,6 +17,22 @@ const {
   ALLOWED_ORIGINS: allowedOrigins,
 } = require("./config/env");
 const logger = require("./utils/logger");
+
+// Global Process Diagnostics & Unhandled Error Surveillance
+process.on("unhandledRejection", (reason) => {
+  logger.error("unhandled_promise_rejection", {
+    reason: reason instanceof Error ? reason.stack : String(reason),
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  logger.error("uncaught_exception", {
+    error: error.stack || error.message,
+  });
+  if (IS_PROD) {
+    process.exit(1);
+  }
+});
 const {
   hashPassword,
   verifyPassword,
