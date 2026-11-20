@@ -1039,26 +1039,80 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
 
 // Integer-paise formatIndianCurrency is imported from ./utils/money
 
+// Order Idempotency Cache (60-second TTL to prevent duplicate fills on rapid clicks or network retries)
+const orderIdempotencyCache = new Map();
+const IDEMPOTENCY_TTL_MS = 60 * 1000;
+
+function cleanupIdempotencyCache() {
+  const now = Date.now();
+  for (const [key, record] of orderIdempotencyCache.entries()) {
+    if (record.expiresAt <= now) {
+      orderIdempotencyCache.delete(key);
+    }
+  }
+}
+setInterval(cleanupIdempotencyCache, 30 * 1000).unref();
+
 // 1. Transactional Order Engine with Portfolio & Funds Synchronization
 app.post("/newOrder", requireAuth, tradeFundsLimiter, async (req, res) => {
+  const userId = getAuthenticatedUserId(req);
+  const idempotencyKey = String(req.headers["idempotency-key"] || req.body?.idempotencyKey || "").trim();
+  const cacheKey = idempotencyKey ? `${userId}:${idempotencyKey}` : null;
+
+  if (cacheKey) {
+    const cached = orderIdempotencyCache.get(cacheKey);
+    if (cached) {
+      if (cached.status === "IN_FLIGHT") {
+        return res.status(409).json({
+          success: false,
+          message: "A matching order with this idempotency key is currently being processed. Please wait.",
+        });
+      }
+      return res.status(cached.httpStatus).json(cached.payload);
+    }
+    orderIdempotencyCache.set(cacheKey, {
+      status: "IN_FLIGHT",
+      expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+    });
+  }
+
   try {
     const { name, qty, price, mode = "BUY", product = "CNC" } = req.body;
-    const userId = getAuthenticatedUserId(req);
     const input = { name: typeof name === "string" ? name.trim().toUpperCase() : name, qty: Number(qty), price: Number(price), mode, product, userId };
     const result = req.body.orderType === "LIMIT" ? await reservations.place(input, executeOrderInternal)
       : await executeOrderInternal(input);
     if (!result.success) {
       const status = result.code === "CDSL_AUTH_REQUIRED" ? 403 : 400;
+      if (cacheKey) {
+        orderIdempotencyCache.set(cacheKey, {
+          status: "COMPLETED",
+          httpStatus: status,
+          payload: result,
+          expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+        });
+      }
       return res.status(status).json(result);
     }
     console.log(`⚡ [ORDER EXECUTED] ${mode} ${qty} ${name} @ ₹${price} (${product}) for ${userId}`);
-    return res.status(201).json({
+    const responsePayload = {
       success: true,
       message: result.order.status === "PENDING" ? "Limit order pending with funds reserved." : `Order executed: ${mode} ${qty} ${name} @ ₹${result.order.price} (${product})`,
       order: result.order,
       funds: result.funds,
-    });
+    };
+    if (cacheKey) {
+      orderIdempotencyCache.set(cacheKey, {
+        status: "COMPLETED",
+        httpStatus: 201,
+        payload: responsePayload,
+        expiresAt: Date.now() + IDEMPOTENCY_TTL_MS,
+      });
+    }
+    return res.status(201).json(responsePayload);
   } catch (error) {
+    if (cacheKey) {
+      orderIdempotencyCache.delete(cacheKey);
+    }
     if (error?.status === 429) {
       return res.status(429).json({ success: false, message: error.message });
     }

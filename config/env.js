@@ -26,6 +26,10 @@ if (IS_PROD) {
   }
 }
 
+const DATA_ENCRYPTION_KEY =
+  process.env.DATA_ENCRYPTION_KEY ||
+  (IS_PROD ? "" : "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+
 // Development/test ephemeral fallback if JWT_SECRET is omitted locally (never allowed in production)
 const JWT_SECRET =
   process.env.JWT_SECRET ||
@@ -79,6 +83,7 @@ module.exports = {
   PORT,
   MONGO_URL,
   JWT_SECRET,
+  DATA_ENCRYPTION_KEY,
   PUBLIC_FRONTEND_URL,
   PUBLIC_DASHBOARD_URL,
   PUBLIC_BACKEND_URL,

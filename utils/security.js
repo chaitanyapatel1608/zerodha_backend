@@ -132,6 +132,44 @@ function resolveAuthenticatedUserId(req, jwtSecret) {
   return ctx ? ctx.userId : null;
 }
 
+const {
+  isEncrypted,
+  encryptField,
+  decryptField,
+  blindIndex: hashSearchToken,
+} = require("./encryption");
+
+/**
+ * PII Data Masking utilities for SEBI compliant client views and logs
+ */
+function maskPan(pan) {
+  if (!pan || typeof pan !== "string") return "";
+  const clean = pan.trim().toUpperCase();
+  if (clean.length !== 10) return "******";
+  return `${clean.slice(0, 5)}****${clean.slice(-1)}`;
+}
+
+function maskAadhaar(aadhaar) {
+  if (!aadhaar || typeof aadhaar !== "string") return "";
+  const clean = aadhaar.replace(/\D/g, "");
+  if (clean.length < 4) return "********";
+  return `********${clean.slice(-4)}`;
+}
+
+function maskPhone(phone) {
+  if (!phone || typeof phone !== "string") return "";
+  const clean = phone.replace(/\D/g, "");
+  if (clean.length < 4) return "******";
+  return `${clean.slice(0, 2)}******${clean.slice(-2)}`;
+}
+
+function maskEmail(email) {
+  if (!email || typeof email !== "string" || !email.includes("@")) return "";
+  const [user, domain] = email.trim().toLowerCase().split("@");
+  if (user.length <= 2) return `*@${domain}`;
+  return `${user[0]}***${user[user.length - 1]}@${domain}`;
+}
+
 module.exports = {
   hashPassword,
   verifyPassword,
@@ -141,4 +179,12 @@ module.exports = {
   parseCookies,
   resolveAuthContext,
   resolveAuthenticatedUserId,
+  isEncrypted,
+  encryptField,
+  decryptField,
+  hashSearchToken,
+  maskPan,
+  maskAadhaar,
+  maskPhone,
+  maskEmail,
 };

@@ -28,6 +28,10 @@ const {
   parseCookies,
   resolveAuthContext,
   resolveAuthenticatedUserId,
+  maskPan,
+  maskAadhaar,
+  maskPhone,
+  maskEmail,
 } = require("../utils/security");
 
 const { escapeHtml, renderConfirmationPage } = require("../utils/html");
@@ -157,6 +161,12 @@ test("UNIT-Security: scrypt hashing, constantTimeEquals, escapeRegex, ObjectId, 
   assert.equal(parsed.zerodha_csrf, "xyz");
   assert.equal(parsed.bad, "%E0%A4%A");
   assert.deepEqual(parseCookies(""), {});
+
+  // PII Masking Tests
+  assert.equal(maskPan("ABCDE1234F"), "ABCDE****F");
+  assert.equal(maskAadhaar("123456789012"), "********9012");
+  assert.equal(maskPhone("9876543210"), "98******10");
+  assert.equal(maskEmail("chaitanya@example.com"), "c***a@example.com");
 });
 
 test("UNIT-Security: resolveAuthContext validates HS256 JWTs from Bearer and cookie", () => {
