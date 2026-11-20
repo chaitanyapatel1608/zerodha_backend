@@ -15,20 +15,21 @@ function balanceChange(funds, cash, collateral) {
   funds.equity.availableCash = formatPaiseINR(toPaise(funds.equity.availableCash) + cash);
   funds.equity.availableMargin = formatPaiseINR(toPaise(funds.equity.availableMargin) + cash + collateral);
 }
-async function place(input, execute) {
-  return runInTransaction(async session => {
+async function place(input, execute, existingSession = null, { reserveOnly = false } = {}) {
+  const apply = async session => {
     const { userId, name, qty, price, mode, product } = input;
     const value = orderValuePaise(qty, price);
-    if (!Number.isSafeInteger(qty) || qty < 1 || qty > 10000 || !(price > 0) || value == null ||
+    if (typeof name !== "string" || !name.trim() || !Number.isFinite(price) || !Number.isSafeInteger(qty) || qty < 1 || qty > 10000 || !(price > 0) || value == null || value <= 0 ||
         !["BUY","SELL"].includes(mode) || !["CNC","MIS","NRML"].includes(product)) {
       return { success: false, message: "Invalid limit order." };
     }
     const quote = await executionQuote(name, session);
     if (!quote) return { success: false, message: "Quote unavailable." };
-    if (mode === "BUY" ? quote.price <= price : quote.price >= price) return execute(input, session);
+    if (!reserveOnly && (mode === "BUY" ? quote.price <= price : quote.price >= price)) return execute(input, session);
     const funds = await FundsModel.findOne({ userId }).session(session);
     if (!funds) return { success: false, message: "Fund the account first." };
     let shares = 0;
+    let linkedPosition;
     let required = value * (product === "MIS" ? 0.2 : 1);
     if (product === "CNC" && mode === "SELL") {
       const holding = await HoldingsModel.findOne({ userId, name }).session(session);
@@ -40,7 +41,9 @@ async function place(input, execute) {
     } else if (product !== "CNC") {
       const position = await PositionsModel.findOne({ userId, name, product, qty: { $ne: 0 } }).session(session);
       if (position && position.qty * (mode === "BUY" ? 1 : -1) < 0) {
-        return { success: false, message: "Pending position reductions require position reservation support." };
+        if (qty > Math.abs(position.qty)) return { success: false, message: "Separate a pending reversal into a reduction and a new entry." };
+        linkedPosition = position._id;
+        required = 0;
       }
     }
     required = Math.round(required);
@@ -53,14 +56,15 @@ async function place(input, execute) {
     const collateralPaise = required + 2000 - cashPaise;
     balanceChange(funds, -cashPaise, -collateralPaise);
     await funds.save({ session });
-    const reservation = new ReservationModel({ ...input, cashPaise, collateralPaise, shares });
+    const reservation = new ReservationModel({ ...input, cashPaise, collateralPaise, shares, linkedPosition });
     await reservation.save({ session });
     return { success: true, order: reservation, funds: funds.equity };
-  });
+  };
+  return existingSession ? apply(existingSession) : runInTransaction(apply);
 }
-async function cancel(id, userId) {
-  return runInTransaction(async session => {
-    const reservation = await ReservationModel.findOne({ _id: id, userId, status: "PENDING" }).session(session);
+async function cancel(id, userId, existingSession = null, allowManaged = false) {
+  const apply = async session => {
+    const reservation = await ReservationModel.findOne({ _id: id, userId, status: "PENDING", ...(allowManaged ? {} : { parentGtt: null }) }).session(session);
     if (!reservation) return false;
     const funds = await FundsModel.findOne({ userId }).session(session);
     balanceChange(funds, reservation.cashPaise, reservation.collateralPaise);
@@ -68,13 +72,34 @@ async function cancel(id, userId) {
     await funds.save({ session });
     await reservation.save({ session });
     return true;
-  });
+  };
+  return existingSession ? apply(existingSession) : runInTransaction(apply);
 }
-async function evaluatePending(execute, session) {
-  const rows = await ReservationModel.find({ status: "PENDING" }).sort({ createdAt: 1, _id: 1 }).session(session);
-  for (const row of rows) {
-    const quote = await executionQuote(row.name, session);
-    if (!quote || (row.mode === "BUY" ? quote.price > row.price : quote.price < row.price)) continue;
+class EditRejected extends Error {
+  constructor(result) { super(result.message); this.result = result; }
+}
+async function edit(id, userId, changes, execute) {
+  try {
+    return await runInTransaction(async session => {
+      const previous = await ReservationModel.findOne({ _id: id, userId, status: "PENDING", parentGtt: null }).session(session);
+      if (!previous) return { success: false, message: "Pending order unavailable." };
+      await cancel(id, userId, session);
+      const result = await place({ userId, name: previous.name, mode: previous.mode, product: previous.product,
+        qty: changes.qty === undefined ? previous.qty : changes.qty,
+        price: changes.price === undefined ? previous.price : changes.price }, execute, session);
+      // Aborting restores both the original reservation and its original priority.
+      if (!result.success) throw new EditRejected(result);
+      previous.status = "CANCELLED";
+      previous.reason = `Replaced by ${result.order._id}`;
+      await previous.save({ session });
+      return result;
+    });
+  } catch (error) {
+    if (error instanceof EditRejected) return error.result;
+    throw error;
+  }
+}
+async function executeReserved(row, execute, session) {
     const funds = await FundsModel.findOne({ userId: row.userId }).session(session);
     balanceChange(funds, row.cashPaise, row.collateralPaise);
     await funds.save({ session });
@@ -90,6 +115,14 @@ async function evaluatePending(execute, session) {
       await funds.save({ session });
     }
     await row.save({ session });
+    return result;
+}
+async function evaluatePending(execute, session, filter = {}) {
+  const rows = await ReservationModel.find({ ...filter, status: "PENDING", parentGtt: null }).sort({ createdAt: 1, _id: 1 }).session(session);
+  for (const row of rows) {
+    const quote = await executionQuote(row.name, session);
+    if (!quote || (row.mode === "BUY" ? quote.price > row.price : quote.price < row.price)) continue;
+    await executeReserved(row, execute, session);
   }
 }
-module.exports = { place, cancel, reservedShares, evaluatePending };
+module.exports = { place, cancel, edit, reservedShares, evaluatePending, executeReserved };

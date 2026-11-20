@@ -56,6 +56,7 @@ async function closePositions(filter, { bulk = false, admin = false, audit } = {
       Object.assign(position, { pnl: position.realizedPnl, unrealizedPnl: 0, qty: 0, ltp: quote.price,
         status: "CLOSED", closedAt: new Date(), isProfit: position.realizedPnl >= 0, isLoss: position.realizedPnl < 0 });
       await position.save({ session });
+      await require("./linkedExits").capLinkedExits(position._id, 0, funds, session);
       await new NotificationModel({ userId, type: admin ? "COMPLIANCE" : "ORDER",
         category: admin ? "RMS_SQUARE_OFF" : "TRADE", title: "Position closed: " + symbol,
         description: "Closed " + Math.abs(qty) + " units at " + quote.price + ". Execution fee: INR 20." }).save({ session });

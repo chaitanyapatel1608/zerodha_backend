@@ -41,6 +41,8 @@ const GttSchema = new Schema({
   activatedBranches: [String],
   executedBranch: String,
   executedOrder: Schema.Types.ObjectId,
+  reservation: Schema.Types.ObjectId,
+  linkedPosition: Schema.Types.ObjectId,
   lastReason: String,
   triggerPrice: Number,
   orderPrice: Number,

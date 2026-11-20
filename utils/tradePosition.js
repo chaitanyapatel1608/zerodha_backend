@@ -42,6 +42,7 @@ async function tradePosition({ userId, name, product, side, units, price, funds,
   equity.availableMargin = formatPaiseINR(available + cashReleased + collateralReleased + pnl - fee - margin);
   equity.usedMargin = formatPaiseINR(used - cashReleased - collateralReleased + margin);
   await position.save({ session });
+  if (closing) await require("./linkedExits").capLinkedExits(position._id, closing === Math.abs(old) ? 0 : Math.abs(net), funds, session);
   await funds.save({ session });
   return { success: true };
 }

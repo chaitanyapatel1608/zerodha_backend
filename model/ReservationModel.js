@@ -11,6 +11,8 @@ const ReservationSchema = new Schema({
   shares: { type: Number, default: 0 },
   status: { type: String, enum: ["PENDING","FILLED","CANCELLED"], default: "PENDING", index: true },
   order: Schema.Types.ObjectId,
+  parentGtt: Schema.Types.ObjectId,
+  linkedPosition: Schema.Types.ObjectId,
   reason: String
 }, { timestamps: true });
 module.exports = { ReservationModel: model("order_reservation", ReservationSchema) };

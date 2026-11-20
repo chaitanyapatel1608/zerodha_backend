@@ -700,138 +700,14 @@ for (const [route, bulk] of [["/squareOffPosition", false], ["/squareOffAllPosit
 }
 
 // 3. Convert Position (MIS <-> CNC/NRML)
-app.post("/convertPosition", requireAuth, async (req, res) => {
+app.post("/convertPosition", requireAuth, tradeFundsLimiter, async (req, res) => {
+  if (!isValidObjectId(req.body?.positionId)) return res.status(400).json({ success: false, message: "Invalid position ID." });
   try {
-    const userId = getAuthenticatedUserId(req);
-    if (!userId) {
-      return res.status(401).json({ success: false, message: "User authentication required" });
-    }
-    const { positionId, targetProduct } = req.body;
-    const position = await PositionsModel.findOne({ _id: positionId, userId });
-    if (!position || position.qty === 0) {
-      return res.status(400).json({ success: false, message: "Active open position required to convert." });
-    }
-
-    const currentProduct = (position.product || "MIS").toUpperCase();
-    const desiredProduct = (targetProduct || (currentProduct === "MIS" ? "CNC" : "MIS")).toUpperCase();
-
-    if (currentProduct === desiredProduct) {
-      return res.status(400).json({ success: false, message: `Position is already ${currentProduct}.` });
-    }
-
-    const sym = position.instrument || position.name;
-    const qty = Math.abs(position.qty);
-    const avg = position.avg;
-    const orderCost = qty * avg;
-    const funds = await getOrCreateUserFunds(userId);
-
-    if (toPaise(funds.equity.totalCollateral) || position.collateralMarginPaise || (position.qty < 0 && desiredProduct === "CNC")) {
-      return res.status(409).json({ success: false, message: "Conversion requires verified cash funding and an eligible position." });
-    }
-    if (currentProduct === "MIS" && (desiredProduct === "CNC" || desiredProduct === "NRML")) {
-      // MIS (20%) -> CNC/NRML (100%): Requires additional 80% margin!
-      const additionalMarginRequired = orderCost * 0.8;
-      let currentAvailable = parseFloat(funds?.equity?.availableMargin?.replace(/,/g, "") || "0");
-
-      if (currentAvailable < additionalMarginRequired) {
-        return res.status(400).json({
-          success: false,
-          code: "INSUFFICIENT_MARGIN",
-          message: `Cannot convert to ${desiredProduct}! Insufficient cash margin. Additional required: ₹${formatIndianCurrency(additionalMarginRequired)}, Available: ₹${formatIndianCurrency(currentAvailable)}.`,
-        });
-      }
-
-      currentAvailable -= additionalMarginRequired;
-      let currentUsed = parseFloat(funds.equity.usedMargin.replace(/,/g, "")) || 0;
-      currentUsed += additionalMarginRequired;
-
-      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
-      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-      await funds.save();
-
-      // If converting to CNC, also mirror into Demat HoldingsModel if long
-      if (desiredProduct === "CNC" && position.qty > 0) {
-        let holding = await HoldingsModel.findOne({ userId, $or: [{ name: sym }, { instrument: sym }] });
-        if (holding) {
-          const totalShares = holding.qty + qty;
-          const totalCost = holding.qty * (holding.avg || holding.price) + qty * avg;
-          holding.avg = Number((totalCost / totalShares).toFixed(2));
-          holding.qty = totalShares;
-          holding.curVal = Number((totalShares * (position.ltp || avg)).toFixed(2));
-          await holding.save();
-        } else {
-          holding = new HoldingsModel({
-            userId,
-            name: sym,
-            instrument: sym,
-            qty,
-            avg,
-            avgCost: avg,
-            price: avg,
-            ltp: position.ltp || avg,
-            curVal: Number((qty * (position.ltp || avg)).toFixed(2)),
-            pnl: 0,
-            net: "+0.00%",
-            day: "+0.00%",
-            isProfit: true,
-          });
-          await holding.save();
-        }
-      }
-    } else if ((currentProduct === "CNC" || currentProduct === "NRML") && desiredProduct === "MIS") {
-      // CNC (100%) -> MIS (20%): Releases 80% margin back to available cash!
-      const releasedMargin = orderCost * 0.8;
-      let currentAvailable = parseFloat(funds?.equity?.availableMargin?.replace(/,/g, "") || "0");
-      let currentUsed = parseFloat(funds?.equity?.usedMargin?.replace(/,/g, "")) || 0;
-
-      currentAvailable += releasedMargin;
-      currentUsed = Math.max(0, currentUsed - releasedMargin);
-
-      funds.equity.availableMargin = formatIndianCurrency(currentAvailable);
-      funds.equity.usedMargin = formatIndianCurrency(currentUsed);
-      funds.equity.availableCash = formatIndianCurrency(currentAvailable);
-      await funds.save();
-
-      // Remove from holdings if it came from CNC
-      if (currentProduct === "CNC") {
-        let holding = await HoldingsModel.findOne({ userId, $or: [{ name: sym }, { instrument: sym }] });
-        if (holding) {
-          holding.qty = Math.max(0, holding.qty - qty);
-          if (holding.qty === 0) {
-            await HoldingsModel.deleteOne({ _id: holding._id });
-          } else {
-            await holding.save();
-          }
-        }
-      }
-    }
-
-    position.cashMarginPaise = Math.round(qty * avg * (desiredProduct === "MIS" ? 20 : 100));
-    position.collateralMarginPaise = 0;
-    position.product = desiredProduct;
-    position.convertedAt = new Date();
-    await position.save();
-
-    try {
-      await createNotification({
-        userId,
-        type: "ORDER",
-        category: "TRADE",
-        title: `Position Converted: ${sym}`,
-        description: `Successfully converted ${qty} ${sym} from ${currentProduct} to ${desiredProduct}.`,
-        status: "SUCCESS",
-      });
-    } catch (e) {}
-
-    res.status(200).json({
-      success: true,
-      message: `Position in ${sym} successfully converted from ${currentProduct} to ${desiredProduct}!`,
-      position,
-    });
+    const position = await require("./utils/convertPosition").convertPosition(getAuthenticatedUserId(req),
+      req.body.positionId, req.body.targetProduct, req.body.qty);
+    return res.json({ success: true, message: "Position conversion completed.", position });
   } catch (error) {
-    console.error("Error converting position:", error);
-    res.status(500).json({ success: false, message: "Failed to convert position." });
+    return res.status(error.conversionStatus || 500).json({ success: false, message: error.conversionStatus ? error.message : "Conversion failed." });
   }
 });
 
@@ -841,7 +717,9 @@ app.get("/allOrders", requireAuth, async (req, res) => {
     if (!userId) {
       return res.status(200).json([]);
     }
-    const allOrders = await OrdersModel.find({ userId }).sort({ createdAt: -1 });
+    const executed = await OrdersModel.find({ userId }).lean();
+    const pending = await require("./model/ReservationModel").ReservationModel.find({ userId, status: { $ne: "FILLED" }, parentGtt: null }).lean();
+    const allOrders = [...executed, ...pending].sort((a, b) => +b.createdAt - +a.createdAt);
     res.status(200).json(allOrders);
   } catch (error) {
     console.error("Error fetching orders:", error);
@@ -926,7 +804,8 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
     return { success: false, message: "A symbol, valid displayed quote and 1 to 10,000 whole units are required." };
   }
   name = name.trim().toUpperCase();
-  const quote = await executionQuote(name, outerSession);
+  const applyOrder = async session => {
+  const quote = await executionQuote(name, session);
   if (!quote) return { success: false, code: "QUOTE_UNAVAILABLE", message: "No server quote available for this instrument." };
   const numPrice = quote.price;
   const orderCostPaise = orderValuePaise(numQty, numPrice);
@@ -936,7 +815,7 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
 
   // 🛡️ Pre-Trade Risk Engine: Segments & Kill Switch Enforcement
   try {
-    const userDoc = await UserModel.findOne({ userId });
+    const userDoc = await UserModel.findOne({ userId }).session(session);
     if (userDoc && userDoc.segments) {
       let requiredSegment = "equity";
       const upperName = (name || "").toUpperCase();
@@ -966,12 +845,19 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
 
       const segConfig = userDoc.segments[requiredSegment];
       if (segConfig && segConfig.active === false) {
+        const position = product.toUpperCase() === "CNC"
+          ? await HoldingsModel.findOne({ userId, name }).session(session)
+          : await PositionsModel.findOne({ userId, name, product: product.toUpperCase(), qty: { $ne: 0 } }).session(session);
+        const signed = mode.toUpperCase() === "BUY" ? numQty : -numQty;
+        const pureReduction = position && position.qty * signed < 0 && Math.abs(signed) <= Math.abs(position.qty);
+        if (!pureReduction) {
         const segDisplayName = segConfig.name || requiredSegment;
         return {
           success: false,
           code: "SEGMENT_DISABLED",
           message: `Order rejected! Trading in "${segDisplayName}" is disabled under your Risk Settings / Kill Switch.`,
         };
+      }
       }
     }
   } catch (segErr) {
@@ -987,7 +873,7 @@ async function executeOrderInternal({ name, qty, price, mode = "BUY", product = 
   const marginRequiredPaise = orderProduct === "MIS" ? Math.round(orderCostPaise * 0.2) : orderCostPaise;
   const orderCost = fromPaise(orderCostPaise);
 
-  const applyOrder = async session => {
+
       const sOpt = session ? { session } : undefined;
       let funds = await getOrCreateUserFunds(userId, session);
       if (!funds) {
@@ -1187,6 +1073,13 @@ app.post("/cancelOrder/:id", requireAuth, tradeFundsLimiter, async (req, res) =>
   res.status(cancelled ? 200 : 409).json({ success: cancelled });
 });
 
+app.put("/modifyOrder/:id", requireAuth, tradeFundsLimiter, async (req, res) => {
+  if (!isValidObjectId(req.params.id)) return res.status(400).json({ success: false });
+  const result = await reservations.edit(req.params.id, getAuthenticatedUserId(req),
+    { qty: req.body.qty, price: req.body.price }, executeOrderInternal);
+  res.status(result.success ? 200 : 409).json(result);
+});
+
 app.get("/allWatchlist", async (req, res) => {
   try {
     const allWatchlist = await WatchlistModel.find({});
@@ -1306,6 +1199,15 @@ app.get("/userWatchlistTabs", requireAuth, async (req, res) => {
   }
 });
 
+// Default NIFTY 50 Starter Pack for brand new traders
+const DEFAULT_STARTER_STOCKS = [
+  { symbol: "RELIANCE", name: "Reliance Industries", exchange: "NSE", sector: "Energy", price: 2712.9, change: 24.8, percent: "+0.92%", isDown: false },
+  { symbol: "TCS", name: "Tata Consultancy Services", exchange: "NSE", sector: "Technology", price: 3982.75, change: 15.4, percent: "+0.39%", isDown: false },
+  { symbol: "HDFCBANK", name: "HDFC Bank Ltd", exchange: "NSE", sector: "Financial Services", price: 1728.15, change: -6.4, percent: "-0.37%", isDown: true },
+  { symbol: "INFY", name: "Infosys Ltd", exchange: "NSE", sector: "Technology", price: 1845.5, change: -18.2, percent: "-0.98%", isDown: true },
+  { symbol: "ICICIBANK", name: "ICICI Bank Ltd", exchange: "NSE", sector: "Financial Services", price: 1242.0, change: 11.8, percent: "+0.96%", isDown: false },
+];
+
 // GET /userWatchlist - Get a specific tab's stocks and metadata
 app.get("/userWatchlist", requireAuth, async (req, res) => {
   try {
@@ -1318,7 +1220,7 @@ app.get("/userWatchlist", requireAuth, async (req, res) => {
         userId,
         tabId,
         tabName: `Watchlist ${tabId}`,
-        stocks: [],
+        stocks: tabId === 1 ? DEFAULT_STARTER_STOCKS : [],
       });
       await tabDoc.save();
     }
@@ -1327,6 +1229,38 @@ app.get("/userWatchlist", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("Error fetching user watchlist:", error);
     return res.status(500).json({ error: "Failed to fetch user watchlist" });
+  }
+});
+
+// POST /seedStarterWatchlist - 1-Tap Load Market Leaders Starter Pack
+app.post("/seedStarterWatchlist", requireAuth, async (req, res) => {
+  try {
+    const userId = getAuthenticatedUserId(req);
+    const tabId = parseInt(req.body?.tabId) || 1;
+
+    let tabDoc = await UserWatchlistModel.findOne({ userId, tabId });
+    if (!tabDoc) {
+      tabDoc = new UserWatchlistModel({
+        userId,
+        tabId,
+        tabName: `Watchlist ${tabId}`,
+        stocks: [],
+      });
+    }
+
+    const existingSymbols = new Set(tabDoc.stocks.map((s) => s.symbol.toUpperCase()));
+    for (const item of DEFAULT_STARTER_STOCKS) {
+      if (!existingSymbols.has(item.symbol.toUpperCase()) && tabDoc.stocks.length < 50) {
+        tabDoc.stocks.push(item);
+        existingSymbols.add(item.symbol.toUpperCase());
+      }
+    }
+
+    await tabDoc.save();
+    return res.status(200).json({ success: true, tab: tabDoc });
+  } catch (error) {
+    console.error("Error seeding starter watchlist:", error);
+    return res.status(500).json({ success: false, message: "Failed to seed starter watchlist" });
   }
 });
 
@@ -1782,14 +1716,26 @@ app.post("/newGtt", requireAuth, async (req, res) => {
       status: "ACTIVE",
     });
 
-    const savedGtt = await newGtt.save();
-    const evaluated = await gttExecution.evaluate(savedGtt._id, userId, executeOrderInternal);
+    const evaluated = await runInTransaction(async session => {
+      if (newGtt.product !== "CNC") {
+        const source = await PositionsModel.findOne({ userId, name: newGtt.symbol, product: newGtt.product, qty: { $ne: 0 } }).session(session);
+        const signed = newGtt.transactionType === "BUY" ? newGtt.qty : -newGtt.qty;
+        if (source && source.qty * signed < 0 && newGtt.qty <= Math.abs(source.qty)) {
+          newGtt.linkedPosition = source._id;
+          // Serialize linking with a simultaneous close, even before triggering.
+          source.updatedAt = new Date();
+          await source.save({ session });
+        }
+      }
+      await newGtt.save({ session });
+      return gttExecution.evaluate(newGtt._id, userId, executeOrderInternal, session);
+    });
     console.log(`🎯 [GTT CREATED] ${type} on ${symbol} for ${userId}`);
 
     res.status(201).json({
       success: true,
       message: `GTT trigger order created for ${symbol}`,
-      gtt: evaluated.gtt || savedGtt,
+      gtt: evaluated.gtt || newGtt,
     });
   } catch (error) {
     console.error("Error creating GTT:", error);
@@ -1807,11 +1753,7 @@ app.post("/cancelGtt", requireAuth, async (req, res) => {
     if (!id) {
       return res.status(400).json({ success: false, message: "GTT ID required" });
     }
-    const updated = await GttModel.findOneAndUpdate(
-      { _id: id, userId, status: "ACTIVE" },
-      { status: "CANCELLED" },
-      { new: true }
-    );
+    const updated = await gttExecution.cancel(id, userId);
     if (!updated) {
       return res.status(404).json({ success: false, message: "GTT order not found" });
     }
@@ -4804,7 +4746,7 @@ app.get("/userSegments", requireAuth, async (req, res) => {
     }
 
     const now = Date.now();
-    const twelveHoursMs = 12 * 60 * 60 * 1000;
+    const cooldownMs = 24 * 60 * 60 * 1000;
     const enrichedSegments = {};
 
     for (const [key, seg] of Object.entries(user.segments)) {
@@ -4812,8 +4754,8 @@ app.get("/userSegments", requireAuth, async (req, res) => {
       let canReactivate = true;
       if (!seg.active && seg.deactivatedAt) {
         const elapsed = now - new Date(seg.deactivatedAt).getTime();
-        if (elapsed < twelveHoursMs) {
-          cooldownRemainingMs = twelveHoursMs - elapsed;
+        if (elapsed < cooldownMs) {
+          cooldownRemainingMs = cooldownMs - elapsed;
           canReactivate = false;
         }
       }
@@ -4843,7 +4785,7 @@ app.post("/updateSegments", requireAuth, authLimiter, async (req, res) => {
       return res.status(401).json({ success: false, message: "Authentication required" });
     }
     const { segmentKey, targetState, annualIncome } = req.body;
-    if (!segmentKey || typeof targetState !== "boolean") {
+    if (!["equity", "futuresAndOptions", "currency", "commodity"].includes(segmentKey) || typeof targetState !== "boolean") {
       return res.status(400).json({ success: false, message: "Valid segmentKey and boolean targetState required." });
     }
 
@@ -4870,14 +4812,14 @@ app.post("/updateSegments", requireAuth, authLimiter, async (req, res) => {
     };
 
     const now = new Date();
-    const twelveHoursMs = 12 * 60 * 60 * 1000;
+    const cooldownMs = 24 * 60 * 60 * 1000;
 
-    // Reactivation Check against 12-Hour Kill Switch
+    // Reactivation Check against 24-Hour Kill Switch
     if (targetState === true) {
       if (currentSeg.deactivatedAt) {
         const elapsed = now.getTime() - new Date(currentSeg.deactivatedAt).getTime();
-        if (elapsed < twelveHoursMs) {
-          const hoursLeft = ((twelveHoursMs - elapsed) / (1000 * 60 * 60)).toFixed(1);
+        if (elapsed < cooldownMs) {
+          const hoursLeft = ((cooldownMs - elapsed) / (1000 * 60 * 60)).toFixed(1);
           return res.status(403).json({
             success: false,
             code: "KILL_SWITCH_ACTIVE",
@@ -4912,7 +4854,7 @@ app.post("/updateSegments", requireAuth, authLimiter, async (req, res) => {
           : `🛑 Kill Switch Active - ${currentSeg.name} Deactivated`,
         description: targetState
           ? `Trading is now active for ${currentSeg.name} (${currentSeg.exchange}).`
-          : `Trading in ${currentSeg.name} is disabled. Reactivation is locked for 12 hours as per SEBI Kill Switch risk rules.`,
+          : `Trading in ${currentSeg.name} is disabled. Reactivation is locked for 24 hours under the demo risk policy.`,
         metadata: { actionUrl: "/orders", segmentKey },
       });
     } catch (e) {}
@@ -4921,7 +4863,7 @@ app.post("/updateSegments", requireAuth, authLimiter, async (req, res) => {
       success: true,
       message: targetState
         ? `${currentSeg.name} activated successfully!`
-        : `${currentSeg.name} deactivated via Kill Switch. Locked for 12 hours.`,
+        : `${currentSeg.name} deactivated via Kill Switch. Locked for 24 hours.`,
       segments: user.segments,
     });
   } catch (err) {
@@ -4984,6 +4926,11 @@ app.post("/verifySegmentOtp", requireAuth, authLimiter, async (req, res) => {
     const { otp, segmentKey, annualIncome } = req.body;
     if (!["equity", "futuresAndOptions", "currency", "commodity"].includes(segmentKey)) {
       return res.status(400).json({ success: false, message: "Invalid trading segment specified." });
+    }
+
+    const disabledAt = user.segments?.[segmentKey]?.deactivatedAt;
+    if (disabledAt && Date.now() - +new Date(disabledAt) < 24 * 60 * 60 * 1000) {
+      return res.status(403).json({ success: false, code: "KILL_SWITCH_ACTIVE", message: "This segment has a 24-hour reactivation cooldown." });
     }
 
     const otpKey = `${userEmail}_seg_otp`;
@@ -5408,7 +5355,7 @@ function startBackgroundWorkers() {
     quoteTimer = setInterval(async () => {
       if (quoteBusy) return;
       quoteBusy = true;
-      try { await databaseReady; await advanceQuoteClock(new Date(), async session => { await reservations.evaluatePending(executeOrderInternal, session); await gttExecution.evaluateActive(executeOrderInternal, session); }); }
+      try { await databaseReady; await advanceQuoteClock(new Date(), session => require("./utils/instructionExecution").evaluateInstructions(executeOrderInternal, session)); }
       catch (error) { logger.error("quote_update_failed", { message: error.message }); }
       finally { quoteBusy = false; }
     }, PERIOD);

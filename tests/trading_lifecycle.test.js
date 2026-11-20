@@ -700,3 +700,242 @@ test("Pending delivery limits reserve cash and cancellation releases once", asyn
     await cleanupUser(db, uid);
   }
 });
+
+test("Limit edits preserve rejected reservations and arbitrate edit versus fill atomically", async () => {
+  const db = mongoose.connection.db;
+  const uid = "__EDIT_" + Date.now();
+  await seedUserWithFunds(db, uid, "1,000.00");
+  const reservations = require("../utils/reservations");
+  const { ReservationModel } = require("../model/ReservationModel");
+  const execute = require("../index").executeOrderInternal;
+  const quote = await db.collection("instruments").findOne({ symbol: "INFY" });
+  try {
+    const placed = await reservations.place({ userId: uid, name: "INFY", qty: 1, price: 800, mode: "BUY", product: "CNC" }, execute);
+    const id = placed.order._id;
+    const rejected = await reservations.edit(id, uid, { qty: 2 }, execute);
+    assert.equal(rejected.success, false);
+    assert.equal((await ReservationModel.findById(id)).status, "PENDING");
+    assert.equal((await ReservationModel.findById(id)).qty, 1);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, "180.00");
+    assert.equal((await reservations.edit(id, uid + "other", { price: 700 }, execute)).success, false);
+    assert.equal((await reservations.edit(id, uid, { price: -1 }, execute)).success, false);
+    await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: 799 } });
+    await Promise.all([
+      reservations.edit(id, uid, { price: 800 }, execute),
+      require("../utils/transactions").runInTransaction(session => reservations.evaluatePending(execute, session))
+    ]);
+    assert.equal(await db.collection("orders").countDocuments({ userId: uid }), 1);
+    assert.equal(await ReservationModel.countDocuments({ userId: uid, status: "PENDING" }), 0);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, "181.00");
+  } finally {
+    await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: quote.price } });
+    await ReservationModel.deleteMany({ userId: uid });
+    await cleanupUser(db, uid);
+  }
+});
+
+test("SIP expiry, retry exhaustion, pause and cancellation preserve completed purchases", async () => {
+  const { SipModel } = require("../model/SipModel");
+  const { processInstallment } = require("../utils/sipExecution");
+  const db = mongoose.connection.db;
+  const uid = "__SIP_BOUNDARY_" + Date.now();
+  await seedUserWithFunds(db, uid);
+  const create = (due, extra = {}) => SipModel.create({ userId: uid, name: "Boundary", nextTriggerAt: due,
+    instruments: [{ symbol: "INFY", qty: 1, price: 1200, budget: 1200 }], ...extra });
+  const neverExecute = () => assert.fail("Ineligible installment attempted a purchase");
+  try {
+    const expired = await create(new Date(Date.now() - 86400001));
+    await processInstallment(expired._id, expired.nextTriggerAt, neverExecute);
+    const expiredResult = await SipModel.findById(expired._id);
+    assert.equal(expiredResult.executionLogs[0].status, "SKIPPED");
+    assert.equal(expiredResult.executionLogs[0].legs[0].reason, "Catch-up window expired");
+    const paused = await create(new Date(), { status: "PAUSED" });
+    assert.equal((await processInstallment(paused._id, paused.nextTriggerAt, neverExecute)).success, false);
+    const retry = await create(new Date());
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await processInstallment(retry._id, retry.nextTriggerAt, async () => { throw new Error("Injected technical outage"); });
+      const row = await SipModel.findById(retry._id);
+      if (attempt < 3) {
+        assert.equal(row.installment.legs[0].failures, attempt + 1);
+        assert.ok(row.installment.legs[0].retryAt);
+        await SipModel.updateOne({ _id: retry._id }, { $set: { "installment.legs.0.retryAt": new Date(0) } });
+      } else {
+        assert.equal(row.executionLogs[0].legs[0].reason, "Technical retries exhausted");
+        assert.equal(row.installment, undefined);
+      }
+    }
+    const oversized = await create(new Date(), { instruments: [{ symbol: "INFY", qty: 1, price: 1200, budget: 20000000 }] });
+    await processInstallment(oversized._id, oversized.nextTriggerAt, neverExecute);
+    assert.equal((await SipModel.findById(oversized._id)).executionLogs[0].status, "SKIPPED");
+    const cancelled = await create(new Date());
+    await SipModel.deleteOne({ _id: cancelled._id });
+    assert.equal((await processInstallment(cancelled._id, cancelled.nextTriggerAt, neverExecute)).success, false);
+    assert.equal(await db.collection("orders").countDocuments({ userId: uid }), 0);
+    const partial = await create(new Date(), { instruments: ["INFY", "TCS"].map(symbol => ({ symbol, qty: 1, price: 1200, budget: 1200 })) });
+    const execute = require("../index").executeOrderInternal;
+    await processInstallment(partial._id, partial.nextTriggerAt, (input, session) => {
+      if (input.name === "TCS") throw new Error("Injected second-leg outage");
+      return execute(input, session);
+    });
+    assert.equal(await db.collection("orders").countDocuments({ userId: uid }), 1);
+    await SipModel.deleteOne({ _id: partial._id });
+    assert.equal((await processInstallment(partial._id, partial.nextTriggerAt, neverExecute)).success, false);
+    assert.equal(await db.collection("orders").countDocuments({ userId: uid }), 1);
+  } finally { await cleanupUser(db, uid); }
+});
+
+test("Disabled segments allow pure position reductions but reject reversals and cooldown bypass", async () => {
+  const db = mongoose.connection.db;
+  const uid = "__SEGMENT_EXIT_" + Date.now();
+  await seedUserWithFunds(db, uid);
+  const execute = require("../index").executeOrderInternal;
+  const input = { userId: uid, name: "INFY", qty: 3, price: 1000, mode: "BUY", product: "MIS" };
+  try {
+    assert.equal((await execute(input)).success, true);
+    await db.collection("users").updateOne({ userId: uid }, { $set: {
+      "segments.equity.active": false, "segments.equity.deactivatedAt": new Date(Date.now() - 13 * 3600000)
+    } });
+    assert.equal((await execute({ ...input, qty: 1 })).code, "SEGMENT_DISABLED");
+    assert.equal((await execute({ ...input, qty: 4, mode: "SELL" })).code, "SEGMENT_DISABLED");
+    assert.equal((await execute({ ...input, qty: 1, mode: "SELL" })).success, true);
+    assert.equal((await execute({ ...input, qty: 2, mode: "SELL" })).success, true);
+    assert.equal(await db.collection("positions").countDocuments({ userId: uid, qty: { $ne: 0 } }), 0);
+    const token = mintToken(uid);
+    const reactivate = await apiRequest("/updateSegments", { method: "POST", token,
+      body: { segmentKey: "equity", targetState: true } });
+    assert.equal(reactivate.status, 403);
+    assert.equal(reactivate.data.code, "KILL_SWITCH_ACTIVE");
+    const otpBypass = await apiRequest("/verifySegmentOtp", { method: "POST", token,
+      body: { segmentKey: "equity", otp: "000000" } });
+    assert.equal(otpBypass.status, 403);
+    assert.equal(otpBypass.data.code, "KILL_SWITCH_ACTIVE");
+  } finally { await cleanupUser(db, uid); }
+});
+
+test("OCO shares one trigger-time reservation, cancels once, and fills one sibling", async () => {
+  const db = mongoose.connection.db;
+  const uid = "__OCO_RESERVE_" + Date.now();
+  await seedUserWithFunds(db, uid, "1,000.00");
+  const { GttModel } = require("../model/GttModel");
+  const { ReservationModel } = require("../model/ReservationModel");
+  const gtt = require("../utils/gttExecution");
+  const execute = require("../index").executeOrderInternal;
+  const quote = await db.collection("instruments").findOne({ symbol: "INFY" });
+  const create = () => GttModel.create({ userId: uid, symbol: "INFY", qty: 1, type: "OCO", transactionType: "BUY", product: "CNC",
+    stoplossTrigger: 1000, stoplossPrice: 900, targetTrigger: 800, targetPrice: 800 });
+  try {
+    const first = await create();
+    await Promise.all([gtt.evaluate(first._id, uid, execute), gtt.evaluate(first._id, uid, execute)]);
+    assert.equal(await ReservationModel.countDocuments({ userId: uid, status: "PENDING" }), 1);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, "80.00");
+    await Promise.all([gtt.cancel(first._id, uid), gtt.cancel(first._id, uid)]);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, "1,000.00");
+    const second = await create();
+    await gtt.evaluate(second._id, uid, execute);
+    await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: 790 } });
+    await Promise.all([gtt.evaluate(second._id, uid, execute), gtt.evaluate(second._id, uid, execute)]);
+    assert.equal(await db.collection("orders").countDocuments({ userId: uid }), 1);
+    assert.equal((await GttModel.findById(second._id)).status, "TRIGGERED");
+    assert.equal(await ReservationModel.countDocuments({ userId: uid, status: "PENDING" }), 0);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, "190.00");
+  } finally {
+    await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: quote.price } });
+    await ReservationModel.deleteMany({ userId: uid });
+    await cleanupUser(db, uid);
+  }
+});
+
+test("Quote evaluation honors common priority across limits and GTT instructions", async () => {
+  const db = mongoose.connection.db;
+  const uid = "__PRIORITY_" + Date.now();
+  await seedUserWithFunds(db, uid);
+  const { GttModel } = require("../model/GttModel");
+  const { ReservationModel } = require("../model/ReservationModel");
+  const execute = require("../index").executeOrderInternal;
+  const quote = await db.collection("instruments").findOne({ symbol: "INFY" });
+  try {
+    const limit = await require("../utils/reservations").place({ userId: uid, name: "INFY", qty: 1, price: 900, product: "CNC", mode: "BUY" }, execute);
+    const trigger = await GttModel.create({ userId: uid, symbol: "INFY", qty: 2, product: "CNC", transactionType: "BUY",
+      type: "SINGLE", triggerPrice: 900, orderPrice: 900, createdAt: new Date(+limit.order.createdAt - 1000) });
+    const listed = await apiRequest("/allOrders", { token: mintToken(uid) });
+    assert.ok(listed.data.some(row => row._id === String(limit.order._id) && row.status === "PENDING"));
+    await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: 890 } });
+    const evaluate = () => require("../utils/transactions").runInTransaction(session =>
+      require("../utils/instructionExecution").evaluateInstructions(execute, session));
+    await Promise.all([evaluate(), evaluate()]);
+    const orders = await db.collection("orders").find({ userId: uid }).sort({ _id: 1 }).toArray();
+    assert.deepEqual(orders.map(order => order.qty), [2, 1]);
+    assert.equal(String((await GttModel.findById(trigger._id)).executedOrder), String(orders[0]._id));
+    assert.equal(await ReservationModel.countDocuments({ userId: uid, status: "PENDING" }), 0);
+  } finally {
+    await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: quote.price } });
+    await ReservationModel.deleteMany({ userId: uid });
+    await cleanupUser(db, uid);
+  }
+});
+
+test("Partial conversion preserves basis and funding, and rolls back all writes on failure", async () => {
+  const db = mongoose.connection.db;
+  const uid = "__CONVERT_ATOMIC_" + Date.now();
+  await seedUserWithFunds(db, uid);
+  const execute = require("../index").executeOrderInternal;
+  const { convertPosition } = require("../utils/convertPosition");
+  const { NotificationModel } = require("../model/NotificationModel");
+  const original = NotificationModel.prototype.save;
+  const originalQuote = await db.collection("instruments").findOne({ symbol: "INFY" });
+  await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: 1000 } });
+  try {
+    await execute({ userId: uid, name: "INFY", qty: 5, price: 1000, mode: "BUY", product: "MIS" });
+    const source = await db.collection("positions").findOne({ userId: uid });
+    const before = await db.collection("funds").findOne({ userId: uid });
+    NotificationModel.prototype.save = async function (...args) {
+      if (this.userId === uid) throw new Error("Injected conversion receipt failure");
+      return original.apply(this, args);
+    };
+    await assert.rejects(convertPosition(uid, source._id, "CNC", 2), /receipt failure/);
+    NotificationModel.prototype.save = original;
+    assert.equal((await db.collection("positions").findOne({ _id: source._id })).qty, 5);
+    assert.equal(await db.collection("holdings").countDocuments({ userId: uid }), 0);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, before.equity.availableCash);
+    await convertPosition(uid, source._id, "NRML", 2);
+    const positions = await db.collection("positions").find({ userId: uid }).toArray();
+    assert.equal(positions.find(row => row.product === "MIS").qty, 3);
+    assert.equal(positions.find(row => row.product === "MIS").cashMarginPaise, 60000);
+    const converted = positions.find(row => row.product === "NRML");
+    assert.equal(converted.qty, 2);
+    assert.equal(converted.avg, 1000);
+    assert.equal(converted.cashMarginPaise, 200000);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, "7,380.00");
+    assert.equal(await db.collection("orders").countDocuments({ userId: uid }), 1);
+    await convertPosition(uid, converted._id, "MIS", 2);
+    assert.equal((await db.collection("positions").findOne({ _id: source._id })).qty, 5);
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, before.equity.availableCash);
+  } finally {
+    NotificationModel.prototype.save = original;
+    await db.collection("instruments").updateOne({ symbol: "INFY" }, { $set: { price: originalQuote.price } });
+    await cleanupUser(db, uid);
+  }
+});
+
+test("Pending reduction exits shrink with the source and release their fee on full close", async () => {
+  const db = mongoose.connection.db;
+  const uid = "__LINKED_EXIT_" + Date.now();
+  await seedUserWithFunds(db, uid);
+  const execute = require("../index").executeOrderInternal;
+  const reservations = require("../utils/reservations");
+  const { ReservationModel } = require("../model/ReservationModel");
+  try {
+    const input = { userId: uid, name: "INFY", qty: 5, price: 1000, mode: "BUY", product: "MIS" };
+    await execute(input);
+    const placed = await reservations.place({ ...input, mode: "SELL", price: 2000 }, execute);
+    assert.equal(placed.success, true);
+    assert.equal(placed.order.cashPaise, 2000);
+    assert.ok(placed.order.linkedPosition);
+    await execute({ ...input, mode: "SELL", qty: 2 });
+    assert.equal((await ReservationModel.findById(placed.order._id)).qty, 3);
+    await execute({ ...input, mode: "SELL", qty: 3 });
+    assert.equal((await ReservationModel.findById(placed.order._id)).status, "CANCELLED");
+    assert.equal((await db.collection("funds").findOne({ userId: uid })).equity.availableCash, "9,940.00");
+    assert.equal(await db.collection("orders").countDocuments({ userId: uid }), 3);
+  } finally { await ReservationModel.deleteMany({ userId: uid }); await cleanupUser(db, uid); }
+});

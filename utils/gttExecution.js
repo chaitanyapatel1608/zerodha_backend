@@ -1,6 +1,8 @@
 const { GttModel } = require("../model/GttModel");
 const { runInTransaction } = require("./transactions");
 const { executionQuote } = require("./executionQuote");
+const reservations = require("./reservations");
+const { ReservationModel } = require("../model/ReservationModel");
 
 function branches(gtt) {
   const buy = gtt.transactionType === "BUY";
@@ -27,9 +29,23 @@ async function evaluate(id, userId, execute, existingSession = null) {
     }
     const eligible = branches(gtt).find(b => latched.has(b.key) &&
       (gtt.transactionType === "BUY" ? quote.price <= b.limit : quote.price >= b.limit));
+    let reserved = gtt.reservation ? await ReservationModel.findOne({ _id: gtt.reservation, status: "PENDING" }).session(session) : null;
+    if (latched.size && !reserved) {
+      // One worst-case reservation supports both OCO siblings until either fills.
+      const result = await reservations.place({ userId, name: gtt.symbol, qty: gtt.qty,
+        mode: gtt.transactionType, product: gtt.product, parentGtt: gtt._id,
+        price: Math.max(...branches(gtt).map(branch => branch.limit)) }, execute, session, { reserveOnly: true });
+      if (!result.success) {
+        gtt.lastReason = result.message;
+        gtt.activatedBranches = [];
+        await gtt.save({ session });
+        return { status: 200, gtt, message: result.message };
+      }
+      reserved = result.order;
+      gtt.reservation = reserved._id;
+    }
     if (eligible) {
-      const result = await execute({ userId, name: gtt.symbol, qty: gtt.qty, mode: gtt.transactionType,
-        product: gtt.product, price: quote.price }, session);
+      const result = await reservations.executeReserved(reserved, execute, session);
       if (result.success) {
         gtt.status = "TRIGGERED";
         gtt.triggeredAt = new Date();
@@ -38,8 +54,6 @@ async function evaluate(id, userId, execute, existingSession = null) {
         gtt.lastReason = undefined;
       } else {
         gtt.lastReason = result.message;
-        // A failed funding check must meet its trigger again on a subsequent update.
-        latched.delete(eligible.key);
       }
     }
     gtt.activatedBranches = [...latched];
@@ -49,9 +63,20 @@ async function evaluate(id, userId, execute, existingSession = null) {
   return existingSession ? apply(existingSession) : runInTransaction(apply);
 }
 
+async function cancel(id, userId) {
+  return runInTransaction(async session => {
+    const instruction = await GttModel.findOne({ _id: id, userId, status: "ACTIVE" }).session(session);
+    if (!instruction) return null;
+    if (instruction.reservation) await reservations.cancel(instruction.reservation, userId, session, true);
+    instruction.status = "CANCELLED";
+    await instruction.save({ session });
+    return instruction;
+  });
+}
+
 async function evaluateActive(execute, session) {
   const cursor = GttModel.find({ status: "ACTIVE" }).sort({ createdAt: 1, _id: 1 }).select("_id userId").session(session).lean().cursor();
   for await (const instruction of cursor) await evaluate(instruction._id, instruction.userId, execute, session);
 }
 
-module.exports = { evaluate, evaluateActive };
+module.exports = { evaluate, evaluateActive, cancel };

@@ -35,8 +35,9 @@ async function processInstallment(id, due, execute) {
         if (!expired && leg.retryAt && new Date(leg.retryAt) > new Date()) return;
         const quote = expired ? null : await executionQuote(leg.symbol, session);
         const budget = toPaise(leg.budget);
-        const units = quote ? Math.min(10000, Math.floor((budget - 2000) * 100 / Math.round(quote.price * 10000))) : 0;
-        const result = units > 0 && leg.mode === "BUY" ? await execute({
+        const units = quote ? Math.floor((budget - 2000) * 100 / Math.round(quote.price * 10000)) : 0;
+        const validSize = Number.isSafeInteger(units) && units > 0 && units <= 10000 && orderValuePaise(units, quote?.price) !== null;
+        const result = validSize && leg.mode === "BUY" ? await execute({
           name: leg.symbol, product: leg.product, mode: "BUY", qty: units, price: quote.price, userId: sip.userId
         }, session) : { success: false, message: expired ? "Catch-up window expired" : "No eligible purchase within budget" };
         leg.status = result.success ? "FILLED" : "SKIPPED";
