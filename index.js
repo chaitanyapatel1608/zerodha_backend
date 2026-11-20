@@ -711,6 +711,84 @@ app.post("/convertPosition", requireAuth, tradeFundsLimiter, async (req, res) =>
   }
 });
 
+// ==========================================
+// SEBI RMS ENGINE: MIS 15:15 IST AUTO SQUARE-OFF WORKER
+// ==========================================
+let lastAutoSquareOffDate = null;
+
+async function executeRmsIntradaySquareOff() {
+  const now = new Date();
+  const istTimeStr = now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
+  const istDate = new Date(istTimeStr);
+  const dayOfWeek = istDate.getDay(); // 0 = Sunday, 6 = Saturday
+  const hours = istDate.getHours();
+  const minutes = istDate.getMinutes();
+  const todayKey = istDate.toISOString().split("T")[0];
+
+  // Market days only (Mon-Fri) between 15:15 and 15:30 IST
+  const isMarketDay = dayOfWeek >= 1 && dayOfWeek <= 5;
+  const isSquareOffTime = hours === 15 && minutes >= 15 && minutes < 30;
+
+  if (isMarketDay && isSquareOffTime && lastAutoSquareOffDate !== todayKey) {
+    lastAutoSquareOffDate = todayKey;
+    console.log(`[RMS ENGINE] 15:15 IST Reached. Initiating MIS Intraday Auto Square-Off for ${todayKey}...`);
+    try {
+      const openMisPositions = await PositionsModel.find({
+        product: "MIS",
+        status: { $ne: "CLOSED" },
+        qty: { $ne: 0 },
+      }).select("userId").lean();
+
+      const uniqueUserIds = [...new Set(openMisPositions.map((p) => p.userId))];
+      let closedCount = 0;
+      for (const uid of uniqueUserIds) {
+        try {
+          const res = await closePositions({ userId: uid, product: "MIS" }, { bulk: true, admin: true });
+          closedCount += res.count || 0;
+        } catch (uErr) {
+          console.warn(`[RMS ENGINE] Auto square-off failed for user ${uid}:`, uErr.message);
+        }
+      }
+      console.log(`[RMS ENGINE] Completed MIS Auto Square-Off: ${closedCount} position(s) liquidated across ${uniqueUserIds.length} account(s).`);
+    } catch (err) {
+      console.error("[RMS ENGINE] Error executing MIS Auto Square-off worker:", err.message);
+    }
+  }
+}
+
+// Scheduled check every 30 seconds
+setInterval(executeRmsIntradaySquareOff, 30 * 1000).unref();
+
+// Manual RMS trigger endpoint for testing and risk supervisors
+app.post("/api/admin/rms/triggerAutoSquareOff", requireAuth, async (req, res) => {
+  try {
+    const openMisPositions = await PositionsModel.find({
+      product: "MIS",
+      status: { $ne: "CLOSED" },
+      qty: { $ne: 0 },
+    }).select("userId").lean();
+
+    const uniqueUserIds = [...new Set(openMisPositions.map((p) => p.userId))];
+    let closedCount = 0;
+    for (const uid of uniqueUserIds) {
+      try {
+        const result = await closePositions({ userId: uid, product: "MIS" }, { bulk: true, admin: true });
+        closedCount += result.count || 0;
+      } catch (uErr) {
+        console.warn(`[RMS ENGINE] Manual trigger error for ${uid}:`, uErr.message);
+      }
+    }
+    return res.json({
+      success: true,
+      message: `RMS auto square-off executed. Closed ${closedCount} positions across ${uniqueUserIds.length} accounts.`,
+      closedCount,
+      usersAffected: uniqueUserIds.length,
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 app.get("/allOrders", requireAuth, async (req, res) => {
   try {
     const userId = getAuthenticatedUserId(req);
